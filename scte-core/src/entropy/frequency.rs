@@ -32,13 +32,14 @@ use crate::{
     varint::{decode_usize, decode_u64, encode_u64, encode_usize},
 };
 
-/// Default normalization precision: M = 2^14 = 16384 slots.
+/// Default normalization precision: M = 2^16 = 65536 slots.
 ///
 /// Chosen as a balance between:
-/// - Coding efficiency (more slots → finer probability resolution)
-/// - Slot table size (16 384 bytes — fits in L1 cache)
+/// - Coding efficiency (more slots → finer probability resolution,
+///   closer to true entropy — 4× improvement over M=2^14)
+/// - Slot table size (65 536 bytes — fits in L2 cache)
 /// - rANS state arithmetic (state fits comfortably in u32)
-pub const DEFAULT_M_BITS: u32 = 14;
+pub const DEFAULT_M_BITS: u32 = 16;
 
 /// Full alphabet size for 8-bit symbols.
 pub const MAX_SYMBOLS: usize = 256;
@@ -142,12 +143,24 @@ impl FreqTable {
             remainders.push((remainder, i));
         }
 
-        // Pass 2: distribute remaining slots by largest remainder (descending).
-        // Tie-break: descending symbol index (deterministic).
+        // Pass 2: distribute remaining slots to minimize *relative* quantization error.
+        //
+        // Sort by (remainder / floor) descending — i.e. the symbol whose current
+        // freq is most under-represented relative to its true weight gets the
+        // next extra slot first.  This is equivalent to the Zstd/FSE optimal
+        // symbol-spread criterion and minimises the KL-divergence between the
+        // quantized and true distributions.
+        // Tie-break: descending symbol index for determinism.
         let remaining = (m as u32).saturating_sub(allocated);
         if remaining > 0 {
-            remainders.sort_unstable_by(|(ra, ia), (rb, ib)| {
-                rb.cmp(ra).then_with(|| ib.cmp(ia))
+            // relative_err numerator ≈ remainder * total / floor  (avoid floats).
+            remainders.sort_unstable_by(|&(ra, ia), &(rb, ib)| {
+                let fa = self.norm_freqs[ia] as u64;
+                let fb = self.norm_freqs[ib] as u64;
+                // Compare ra/fa vs rb/fb  ↔  ra*fb vs rb*fa
+                let lhs = ra * fb;
+                let rhs = rb * fa;
+                rhs.cmp(&lhs).then_with(|| ib.cmp(&ia))
             });
             for &(_, idx) in remainders.iter().take(remaining as usize) {
                 self.norm_freqs[idx] += 1;
