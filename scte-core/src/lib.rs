@@ -13,12 +13,16 @@
 /// ├── codec
 /// │   ├── encoder  — encode(&[u8]) → Vec<u8>
 /// │   └── decoder  — decode(&[u8]) → Result<Vec<u8>, ScteError>
-/// └── pipelines
-///     └── text
-///         ├── value        — JSON Value IR + recursive descent parser
-///         ├── canonicalize — canonical JSON serializer
-///         ├── tokenizer    — flat token stream from JSON
-///         └── dictionary   — frequency analysis + token-to-ID mapping (Phase 3)
+/// ├── pipelines
+/// │   └── text
+/// │       ├── value        — JSON Value IR + recursive descent parser
+/// │       ├── canonicalize — canonical JSON serializer
+/// │       ├── tokenizer    — flat token stream from JSON
+/// │       └── dictionary   — frequency analysis + token-to-ID mapping (Phase 3)
+/// └── entropy
+///     ├── frequency — FreqTable: build, normalize, serialize (rANS model)
+///     ├── rans      — rANS encode / decode (Phase 4)
+///     └── codec     — TOKENS section wire format (kinds + payloads)
 /// ```
 ///
 /// # SDK usage
@@ -32,6 +36,7 @@
 /// ```
 pub mod codec;
 pub mod container;
+pub mod entropy;
 pub mod error;
 pub mod pipelines;
 pub mod types;
@@ -86,3 +91,14 @@ pub use pipelines::text::encode_with_dict;
 
 /// Decode a dictionary-encoded token stream back to full tokens.
 pub use pipelines::text::decode_with_dict;
+
+/// Serialize a dictionary-encoded token stream to the TOKENS section payload
+/// (rANS-encoded kinds + varint/raw payloads).
+pub use entropy::encode_token_bytes;
+
+/// Deserialize a TOKENS section payload back to a dictionary-encoded
+/// token stream.
+pub use entropy::decode_token_bytes;
+
+/// Frequency table for the rANS entropy model.
+pub use entropy::FreqTable;
