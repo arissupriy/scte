@@ -11,5 +11,5 @@ pub mod field_type;
 pub mod inferencer;
 pub mod serializer;
 
-pub use field_type::FieldType;
-pub use inferencer::FileSchema;
+pub use field_type::{FieldType, IntHint};
+pub use inferencer::{FieldSchema, FileSchema};
