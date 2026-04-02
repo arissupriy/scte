@@ -110,3 +110,5 @@ desc*.txt
 
 # Keep .github tracked (contains SKILL workflow)
 # .github/
+
+assets/*
