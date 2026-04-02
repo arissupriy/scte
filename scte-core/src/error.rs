@@ -30,6 +30,9 @@ pub enum ScteError {
 
     /// Decoding failed for a semantic reason (e.g. no DATA section present).
     DecodeError(String),
+
+    /// Encoding failed (e.g. symbol out of declared alphabet range).
+    EncodeError(String),
 }
 
 impl fmt::Display for ScteError {
@@ -53,6 +56,7 @@ impl fmt::Display for ScteError {
                 write!(f, "section_count exceeds maximum allowed")
             }
             ScteError::DecodeError(msg) => write!(f, "decode error: {msg}"),
+            ScteError::EncodeError(msg) => write!(f, "encode error: {msg}"),
         }
     }
 }
