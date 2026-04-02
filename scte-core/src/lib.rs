@@ -46,6 +46,18 @@ pub mod varint;
 // ── Pipeline trait + context types ──────────────────────────────────────────
 pub use pipelines::{Pipeline, DataClass, TextSubType, EncodeContext, DecodeContext, Encoded};
 
+/// Two-pass schema-aware JSON encoder (Phase 5).
+pub use pipelines::text::encode_json_two_pass;
+
+/// Output bundle from a Phase 5 two-pass encode.
+pub use pipelines::text::TwoPassOutput;
+
+/// Inferred schema from a JSON file.
+pub use schema::{FileSchema, FieldSchema, FieldType, IntHint};
+
+/// Serialize / deserialize a FileSchema to/from SCHEMA section bytes.
+pub use schema::serializer::{serialize as schema_serialize, deserialize as schema_deserialize};
+
 // ── Top-level convenience re-exports ────────────────────────────────────────
 
 /// Encode `input` bytes into a SCTE container.
