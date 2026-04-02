@@ -9,7 +9,8 @@ pub mod tokenizer;
 pub mod two_pass;
 pub(crate) mod value;
 
-pub use two_pass::{TwoPassOutput, encode_json_two_pass,
+pub use two_pass::{TwoPassOutput, encode_json_two_pass, decode_token_stream,
+                   tokens_to_json, delta_encode_tokens, delta_decode_tokens,
                    schema_encode_tokens, schema_decode_tokens};
 
 pub use canonicalize::canonicalize_json;

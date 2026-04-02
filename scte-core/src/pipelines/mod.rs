@@ -92,3 +92,47 @@ pub trait Pipeline: Send + Sync {
     /// Increment when encoding format changes in a breaking way.
     fn pipeline_version(&self) -> u32;
 }
+// ── TextPipeline ──────────────────────────────────────────────────────────────
+
+/// Concrete implementation of `Pipeline` for JSON / text data.
+///
+/// Under the hood delegates to `encode_json_two_pass` and `decode_token_stream`.
+/// This is the only concrete `Pipeline` implementation for Phase 5-7.
+pub struct TextPipeline;
+
+impl Pipeline for TextPipeline {
+    fn id(&self) -> crate::types::PipelineId {
+        crate::types::PipelineId::Text
+    }
+
+    fn can_handle(&self, class: &DataClass) -> bool {
+        matches!(class, DataClass::Text(..))
+    }
+
+    fn estimate_benefit(&self, sample: &[u8]) -> f32 {
+        // Simple heuristic: JSON-like data compresses well.
+        let first = sample.iter().find(|&&b| !b.is_ascii_whitespace());
+        if matches!(first, Some(b'{') | Some(b'[')) { 0.85 } else { 0.0 }
+    }
+
+    fn encode(&self, input: &[u8], ctx: &EncodeContext) -> Result<Encoded, ScteError> {
+        let out = text::encode_json_two_pass(input, ctx.dict_min_freq)?;
+        Ok(Encoded {
+            dict:   out.dict.serialize(),
+            tokens: out.token_bytes,
+            schema: out.schema_bytes,
+            delta:  out.delta_bytes,
+        })
+    }
+
+    fn decode(&self, encoded: &Encoded, _ctx: &DecodeContext) -> Result<Vec<u8>, ScteError> {
+        let schema = crate::schema::serializer::deserialize(&encoded.schema)?;
+        let dict   = text::Dictionary::deserialize(&encoded.dict)?;
+        let tokens = text::decode_token_stream(
+            &encoded.tokens, &dict, &schema, &encoded.delta,
+        )?;
+        Ok(text::tokens_to_json(&tokens))
+    }
+
+    fn pipeline_version(&self) -> u32 { 7 }
+}

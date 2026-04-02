@@ -145,7 +145,7 @@ fn two_pass_roundtrip_log_json() {
 
     // Decode back.
     let schema = schema_deserialize(&schema_bytes).unwrap();
-    let tokens = decode_token_stream(&out.token_bytes, &out.dict, &schema).unwrap();
+    let tokens = decode_token_stream(&out.token_bytes, &out.dict, &schema, &out.delta_bytes).unwrap();
     assert!(!tokens.is_empty(), "decoded token stream must be non-empty");
 }
 

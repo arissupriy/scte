@@ -28,8 +28,10 @@
 /// responsible for writing these to the SCTE container.
 
 use crate::error::ScteError;
+use crate::schema::FieldType;
+use std::collections::HashMap;
 use crate::pipelines::text::{
-    dictionary::{Dictionary, EncodedToken},
+    dictionary::Dictionary,
     encode_token_bytes, decode_token_bytes,
     encode_with_dict, decode_with_dict,
     tokenize_json,
@@ -45,12 +47,15 @@ use crate::schema::serializer;
 pub struct TwoPassOutput {
     /// Serialized `FileSchema` — write to SCHEMA section (0x08).
     pub schema_bytes: Vec<u8>,
-    /// rANS-compressed token stream — write to TOKENS section.
+    /// rANS/CTW-compressed token stream — write to TOKENS section.
     pub token_bytes: Vec<u8>,
     /// Dictionary used — needed for decoding (caller stores in DICT section).
     pub dict: Dictionary,
     /// Schema used — kept for roundtrip testing / decode.
     pub schema: FileSchema,
+    /// Delta section bytes — empty if no integer columns were delta-encoded.
+    /// Stores the list of field paths that had delta encoding applied (Phase 6).
+    pub delta_bytes: Vec<u8>,
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -71,39 +76,40 @@ pub fn encode_json_two_pass(
         .map_err(|e| ScteError::EncodeError(format!("tokenize: {e}")))?;
     let schema = FileSchema::build(&tokens);
 
-    // Pass 2: rewrite + encode
-    let rewritten = schema_encode_tokens(&tokens, &schema);
-    let dict = Dictionary::build(&rewritten, dict_min_freq);
-    let encoded = encode_with_dict(&rewritten, &dict);
-    let token_bytes = encode_token_bytes(&encoded)
+    // Pass 2: schema-encode → delta-encode → compress
+    let schema_encoded          = schema_encode_tokens(&tokens, &schema);
+    let (delta_encoded, delta_bytes) = delta_encode_tokens(&schema_encoded, &schema);
+    let dict                    = Dictionary::build(&delta_encoded, dict_min_freq);
+    let encoded                 = encode_with_dict(&delta_encoded, &dict);
+    let token_bytes             = encode_token_bytes(&encoded)
         .map_err(|e| ScteError::EncodeError(format!("token_bytes: {e}")))?;
-    let schema_bytes = serializer::serialize(&schema);
+    let schema_bytes            = serializer::serialize(&schema);
 
-    Ok(TwoPassOutput { schema_bytes, token_bytes, dict, schema })
+    Ok(TwoPassOutput { schema_bytes, token_bytes, dict, schema, delta_bytes })
 }
 
-/// Decode a two-pass compressed token stream back to `EncodedToken`s,
-/// with enum indices restored to their string values.
+/// Decode a two-pass compressed token stream back to a `Token` vec,
+/// with enum indices restored to their string values and delta integers
+/// reconstructed to their original values.
 ///
-/// `token_bytes` is the rANS-compressed TOKENS section payload.
+/// `token_bytes` is the rANS/CTW-compressed TOKENS section payload.
 /// `dict` is the dictionary from the DICT section.
 /// `schema` is the schema from the SCHEMA section.
+/// `delta_bytes` is the DELTA section payload (empty slice if no delta section).
 ///
-/// Returns the fully decoded token stream (enum strings restored).
+/// Returns the fully decoded token stream. Use `tokens_to_json` to reconstruct
+/// the original JSON bytes.
 pub fn decode_token_stream(
     token_bytes: &[u8],
     dict: &Dictionary,
     schema: &FileSchema,
-) -> Result<Vec<EncodedToken>, ScteError> {
-    let encoded = decode_token_bytes(token_bytes)?;
-    let mut tokens = decode_with_dict(&encoded, dict)?;
-
-    // Restore enum-encoded NumInt tokens to Str
-    tokens = schema_decode_tokens(&tokens, schema);
-
-    // Re-encode as EncodedToken (no dict substitution; just convert types)
-    let result = encode_with_dict(&tokens, &Dictionary::empty());
-    Ok(result)
+    delta_bytes: &[u8],
+) -> Result<Vec<Token>, ScteError> {
+    let encoded        = decode_token_bytes(token_bytes)?;
+    let tokens         = decode_with_dict(&encoded, dict)?;
+    let schema_decoded = schema_decode_tokens(&tokens, schema);
+    let delta_decoded  = delta_decode_tokens(&schema_decoded, schema, delta_bytes);
+    Ok(delta_decoded)
 }
 
 // ── Schema-aware token rewriting ──────────────────────────────────────────────
@@ -259,6 +265,289 @@ fn token_str(t: &Token) -> &str {
         TokenPayload::Str(s) => s.as_str(),
         _ => "",
     }
+}
+
+// ── Delta encoding (Phase 6) ──────────────────────────────────────────────────
+
+/// Delta-encode integer fields in a token stream.
+///
+/// For each field path classified as `FieldType::Integer` by `schema`,
+/// replaces each `NumInt(v)` token with `NumInt(v - prev)` where `prev`
+/// is the last value seen at that field path (starting from 0).
+///
+/// Enum-encoded `NumInt` tokens (produced by `schema_encode_tokens`) are
+/// NOT delta-encoded — they are identified by `FieldType::Enum` in the schema.
+///
+/// Returns `(encoded_tokens, delta_bytes)` where `delta_bytes` is the
+/// serialized DELTA section payload (list of delta-encoded field paths).
+pub fn delta_encode_tokens(tokens: &[Token], schema: &FileSchema) -> (Vec<Token>, Vec<u8>) {
+    let mut out          = Vec::with_capacity(tokens.len());
+    let mut ctx          = RewriteCtx::new();
+    let mut last_seen: HashMap<String, i64> = HashMap::new();
+    let mut delta_paths: Vec<String>        = Vec::new();
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::ObjOpen  => { ctx.push_obj(); out.push(token.clone()); }
+            TokenKind::ObjClose => { ctx.pop();      out.push(token.clone()); }
+            TokenKind::ArrOpen  => { ctx.push_arr(); out.push(token.clone()); }
+            TokenKind::ArrClose => { ctx.pop();      out.push(token.clone()); }
+
+            TokenKind::Key => {
+                if let TokenPayload::Str(ref k) = token.payload { ctx.set_key(k.clone()); }
+                out.push(token.clone());
+            }
+
+            TokenKind::NumInt => {
+                let path = ctx.current_path();
+                if matches!(schema.field_type(&path), Some(FieldType::Integer { .. })) {
+                    if let TokenPayload::Int(v) = token.payload {
+                        let prev  = *last_seen.get(&path).unwrap_or(&0);
+                        let delta = v - prev;
+                        last_seen.insert(path.clone(), v);
+                        if !delta_paths.contains(&path) {
+                            delta_paths.push(path);
+                        }
+                        out.push(Token {
+                            kind:    TokenKind::NumInt,
+                            payload: TokenPayload::Int(delta),
+                        });
+                        ctx.clear_key();
+                        continue;
+                    }
+                }
+                out.push(token.clone());
+                ctx.clear_key();
+            }
+
+            _ => {
+                out.push(token.clone());
+                ctx.clear_key();
+            }
+        }
+    }
+
+    let delta_bytes = serialize_delta_paths(&delta_paths);
+    (out, delta_bytes)
+}
+
+/// Reverse delta encoding: reconstruct original integer values from deltas.
+///
+/// `delta_bytes` is the DELTA section payload produced by `delta_encode_tokens`.
+/// An empty `delta_bytes` slice is a no-op.
+pub fn delta_decode_tokens(
+    tokens: &[Token],
+    _schema: &FileSchema,
+    delta_bytes: &[u8],
+) -> Vec<Token> {
+    let delta_paths = deserialize_delta_paths(delta_bytes);
+    if delta_paths.is_empty() {
+        return tokens.to_vec();
+    }
+
+    let mut out      = Vec::with_capacity(tokens.len());
+    let mut ctx      = RewriteCtx::new();
+    let mut last_seen: HashMap<String, i64> = HashMap::new();
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::ObjOpen  => { ctx.push_obj(); out.push(token.clone()); }
+            TokenKind::ObjClose => { ctx.pop();      out.push(token.clone()); }
+            TokenKind::ArrOpen  => { ctx.push_arr(); out.push(token.clone()); }
+            TokenKind::ArrClose => { ctx.pop();      out.push(token.clone()); }
+
+            TokenKind::Key => {
+                if let TokenPayload::Str(ref k) = token.payload { ctx.set_key(k.clone()); }
+                out.push(token.clone());
+            }
+
+            TokenKind::NumInt => {
+                let path = ctx.current_path();
+                if delta_paths.contains(&path) {
+                    if let TokenPayload::Int(delta) = token.payload {
+                        let prev  = *last_seen.get(&path).unwrap_or(&0);
+                        let value = prev + delta;
+                        last_seen.insert(path, value);
+                        out.push(Token {
+                            kind:    TokenKind::NumInt,
+                            payload: TokenPayload::Int(value),
+                        });
+                        ctx.clear_key();
+                        continue;
+                    }
+                }
+                out.push(token.clone());
+                ctx.clear_key();
+            }
+
+            _ => {
+                out.push(token.clone());
+                ctx.clear_key();
+            }
+        }
+    }
+    out
+}
+
+fn serialize_delta_paths(paths: &[String]) -> Vec<u8> {
+    use crate::varint::encode_u64;
+    if paths.is_empty() { return Vec::new(); }
+    let mut out = Vec::new();
+    encode_u64(paths.len() as u64, &mut out);
+    for p in paths {
+        let b = p.as_bytes();
+        encode_u64(b.len() as u64, &mut out);
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+fn deserialize_delta_paths(data: &[u8]) -> Vec<String> {
+    use crate::varint::decode_u64;
+    if data.is_empty() { return Vec::new(); }
+    let mut paths = Vec::new();
+    let mut pos   = 0usize;
+    let (count, n) = match decode_u64(data, pos) { Some(v) => v, None => return paths };
+    pos += n;
+    for _ in 0..count {
+        let (len, n) = match decode_u64(data, pos) { Some(v) => v, None => break };
+        pos += n;
+        let end = pos + len as usize;
+        if end > data.len() { break; }
+        if let Ok(s) = std::str::from_utf8(&data[pos..end]) {
+            paths.push(s.to_owned());
+        }
+        pos = end;
+    }
+    paths
+}
+
+// ── JSON reconstruction ───────────────────────────────────────────────────────
+
+/// Reconstruct compact JSON bytes from a decoded token stream.
+///
+/// Produces compact JSON (no whitespace). Object keys are emitted in
+/// declaration order, matching the original document order.
+pub fn tokens_to_json(tokens: &[Token]) -> Vec<u8> {
+    let mut out   = Vec::new();
+    // Stack: (is_object, items_written_so_far)
+    let mut stack: Vec<(bool, usize)> = Vec::new();
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::ObjOpen => {
+                // In array context: comma before this value.
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                out.push(b'{');
+                stack.push((true, 0));
+            }
+            TokenKind::ObjClose => {
+                stack.pop();
+                out.push(b'}');
+            }
+            TokenKind::ArrOpen => {
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                out.push(b'[');
+                stack.push((false, 0));
+            }
+            TokenKind::ArrClose => {
+                stack.pop();
+                out.push(b']');
+            }
+            TokenKind::Key => {
+                // Comma before each key-value pair except the first.
+                if let Some((true, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                if let TokenPayload::Str(ref s) = token.payload {
+                    json_write_str(s, &mut out);
+                    out.push(b':');
+                }
+            }
+            TokenKind::Str => {
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                if let TokenPayload::Str(ref s) = token.payload {
+                    json_write_str(s, &mut out);
+                }
+            }
+            TokenKind::NumInt => {
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                if let TokenPayload::Int(n) = token.payload {
+                    json_write_int(n, &mut out);
+                }
+            }
+            TokenKind::NumFloat => {
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                if let TokenPayload::Float(f) = token.payload {
+                    json_write_float(f, &mut out);
+                }
+            }
+            TokenKind::Bool => {
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                match token.payload {
+                    TokenPayload::Bool(true)  => out.extend_from_slice(b"true"),
+                    TokenPayload::Bool(false) => out.extend_from_slice(b"false"),
+                    _ => {}
+                }
+            }
+            TokenKind::Null => {
+                if let Some((false, ref mut cnt)) = stack.last_mut() {
+                    if *cnt > 0 { out.push(b','); }
+                    *cnt += 1;
+                }
+                out.extend_from_slice(b"null");
+            }
+        }
+    }
+    out
+}
+
+fn json_write_str(s: &str, out: &mut Vec<u8>) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    out.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'"'  => out.extend_from_slice(br#"\""#),
+            b'\\' => out.extend_from_slice(br"\\"),
+            b'\n' => out.extend_from_slice(br"\n"),
+            b'\r' => out.extend_from_slice(br"\r"),
+            b'\t' => out.extend_from_slice(br"\t"),
+            b if b < 0x20 => {
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0xF) as usize]);
+            }
+            b => out.push(b),
+        }
+    }
+    out.push(b'"');
+}
+
+fn json_write_int(n: i64, out: &mut Vec<u8>) {
+    out.extend_from_slice(n.to_string().as_bytes());
+}
+
+fn json_write_float(f: f64, out: &mut Vec<u8>) {
+    out.extend_from_slice(format!("{f}").as_bytes());
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

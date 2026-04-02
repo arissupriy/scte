@@ -44,12 +44,18 @@ pub mod types;
 pub mod varint;
 
 // ── Pipeline trait + context types ──────────────────────────────────────────
-pub use pipelines::{Pipeline, DataClass, TextSubType, EncodeContext, DecodeContext, Encoded};
+pub use pipelines::{Pipeline, DataClass, TextSubType, EncodeContext, DecodeContext, Encoded, TextPipeline};
 
-/// Two-pass schema-aware JSON encoder (Phase 5).
+/// Reconstruct JSON bytes from a decoded token stream.
+pub use pipelines::text::tokens_to_json;
+
+/// Decode a two-pass token stream back to tokens (schema + delta restore).
+pub use pipelines::text::decode_token_stream;
+
+/// Two-pass schema-aware JSON encoder (Phase 5+).
 pub use pipelines::text::encode_json_two_pass;
 
-/// Output bundle from a Phase 5 two-pass encode.
+/// Output bundle from a Phase 5+ two-pass encode.
 pub use pipelines::text::TwoPassOutput;
 
 /// Inferred schema from a JSON file.

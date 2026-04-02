@@ -28,8 +28,17 @@ fn roundtrip_ascii_text() {
 
 #[test]
 fn roundtrip_json_payload() {
-    let input = br#"{"user":{"id":1,"name":"Alice"},"active":true}"#;
-    assert_eq!(decode(&encode(input).unwrap()).unwrap(), input);
+    // The JSON pipeline canonicalizes key order (sorts keys alphabetically),
+    // so byte-identical roundtrip is not expected. Compare canonical forms.
+    use scte_core::canonicalize_json;
+    let input   = br#"{"user":{"id":1,"name":"Alice"},"active":true}"#;
+    let encoded = encode(input).unwrap();
+    let decoded = decode(&encoded).unwrap();
+    assert_eq!(
+        canonicalize_json(input).unwrap(),
+        canonicalize_json(&decoded).unwrap(),
+        "JSON roundtrip must be semantically identical (canonical forms must match)"
+    );
 }
 
 #[test]
