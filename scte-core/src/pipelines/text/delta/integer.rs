@@ -115,7 +115,11 @@ pub fn decode_delta_ints(data: &[u8]) -> Option<Vec<i64>> {
             out.push(varint::zigzag_decode(fz));
             for _ in 1..count {
                 let (dz, n) = varint::decode_u64(data, pos)?; pos += n;
-                let prev = *out.last().unwrap();
+                // `out` was push'd with `first` before this loop, so it always
+                // holds at least one element at this point.  The let-else makes
+                // the invariant explicit and propagates None on impossible failure
+                // instead of panicking.
+                let Some(&prev) = out.last() else { return None; };
                 out.push(prev + varint::zigzag_decode(dz));
             }
             Some(out)

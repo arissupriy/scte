@@ -22,7 +22,10 @@
 /// Total: ~3 bits vs ~60 bytes raw → ~99.4% reduction
 /// ```text
 
-use std::collections::HashMap;
+// Determinism invariant (plans.md §10): all stateful maps in the encode path
+// must use BTreeMap, never HashMap, to guarantee identical output across runs
+// regardless of hash-randomisation seed.
+use std::collections::BTreeMap;
 
 // ── CrossRecordEncoder ────────────────────────────────────────────────────────
 
@@ -31,7 +34,8 @@ use std::collections::HashMap;
 #[derive(Debug, Default, Clone)]
 pub struct CrossRecordEncoder {
     /// Last seen value per field path.
-    prev: HashMap<String, Vec<u8>>,
+    /// BTreeMap — not HashMap — to preserve encoding determinism.
+    prev: BTreeMap<String, Vec<u8>>,
 }
 
 impl CrossRecordEncoder {
@@ -66,7 +70,9 @@ impl CrossRecordEncoder {
 /// Stateful decoder that reconstructs field values from cross-record references.
 #[derive(Debug, Default, Clone)]
 pub struct CrossRecordDecoder {
-    prev: HashMap<String, Vec<u8>>,
+    /// BTreeMap — consistent with encoder; iteration order is never relied upon
+    /// but keeping the same type prevents accidental HashMap use in future.
+    prev: BTreeMap<String, Vec<u8>>,
 }
 
 impl CrossRecordDecoder {

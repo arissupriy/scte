@@ -143,8 +143,11 @@ pub fn decode(
     }
 
     // Read initial state (4 bytes LE).
+    // The slice is guaranteed to be exactly 4 bytes: the early-return guard
+    // `pos + 4 > data.len()` above ensures this path is only reached when at
+    // least 4 bytes are available, so try_into() cannot fail.
     let mut state = u32::from_le_bytes(
-        data[pos..pos + 4].try_into().unwrap(),
+        data[pos..pos + 4].try_into().expect("4-byte slice guaranteed by bounds check above"),
     );
     let mut p = pos + 4;
 

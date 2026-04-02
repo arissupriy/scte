@@ -263,6 +263,186 @@ If deviation occurs, enforce:
 
 ---
 
+# ENGINEERING PRINCIPLES (MANDATORY MINDSET)
+
+These principles govern how an engineer thinks and works — not just what they build.
+
+---
+
+## 1. UNDERSTAND THE PROBLEM DEEPER THAN ASKED
+Before writing code, ask:
+- What is the actual constraint? (latency, memory, throughput, correctness?)
+- Who reads this output, and under what conditions?
+- Is the problem framed correctly, or is the framing itself the bottleneck?
+
+Clarity of problem determines quality of solution.
+
+---
+
+## 2. CONSTRAINTS ARE TOOLS, NOT OBSTACLES
+Every hard constraint — determinism across platforms, lossless reconstruction,
+< 1ms decode latency — forces deeper thinking. Elegant solutions emerge from
+constraint, not from freedom. Never remove a constraint without understanding
+what it was protecting.
+
+---
+
+## 3. CORRECTNESS IS NON-NEGOTIABLE; PERFORMANCE IS A TRADE-OFF
+Order is fixed:
+1. Make it correct
+2. Measure
+3. Optimize only what the measurement reveals
+
+Fast code that is wrong has negative value. Correct code that is slow can be fixed.
+
+---
+
+## 4. CODE IS READ MORE OFTEN THAN WRITTEN
+Every line written today will be read — by a teammate, by yourself in 6 months,
+by an engineer who replaces you. Clarity is a form of respect for the next reader.
+Name things for what they mean, not for what they do mechanically.
+
+---
+
+## 5. THE RIGHT ABSTRACTION, NOT THE MOST GENERAL ONE
+The question is not "how do I make this handle all cases?"
+The question is "what is the minimum contract that is sufficient now,
+and does not close doors for what comes next?"
+Over-engineering is as dangerous as under-engineering.
+
+---
+
+## 6. SYSTEMS FAIL AT EDGES, NOT CENTERS
+Code that works for normal input is the minimum bar. The real character of a
+system shows in: empty input, oversized input, malformed input, concurrent
+access, disk full, network interrupted. Design and test for boundaries first.
+
+---
+
+## 7. MEASURE, NEVER ASSUME
+"This part is probably the bottleneck" is almost always wrong.
+Profilers do not lie. Intuition often does. Never optimize before measuring.
+Never claim a bottleneck before proving it with data.
+
+---
+
+## 8. OWN THE DECISION, NOT JUST THE CODE
+Every architectural decision leaves a trace — sometimes for years.
+"We used HashMap here because it was faster to write" can mean a non-deterministic
+bug that surfaces in production 8 months later. Engineers own temporal consequences.
+
+---
+
+## 9. SIMPLICITY IS THE RESULT OF DEEP THINKING
+Simple solutions are harder to create than complex ones. Complexity is a signal
+that the problem is not yet fully understood. When a solution feels too complicated,
+that is not a sign to add more abstraction — it is a signal to step back and
+re-examine the problem model.
+
+---
+
+## 10. KNOW WHEN NOT TO BUILD
+Sometimes the best solution is an existing library, a changed configuration,
+or a feature that is simply not implemented. The best code is the code that
+does not need to be written.
+
+---
+
+# THINKING BEYOND EXISTING ALGORITHMS
+
+An engineer who only selects from known algorithms is a technician.
+An engineer who creates new algorithms is one who has understood the following:
+
+---
+
+## RULE: AN ALGORITHM IS AN ENCODING OF UNDERSTANDING
+
+Every algorithm embeds assumptions about the structure of the problem.
+Find those assumptions. If your understanding of the problem is deeper than
+the person who designed the algorithm, you will inevitably find something better.
+
+The process:
+
+```
+1. OBSERVE WITHOUT AGENDA
+   Look at the data. Not to compress — just to see.
+   What repeats? What is predictable? What appears random but is not?
+
+2. FORMALIZE
+   Translate observations into mathematics.
+   "Field X is almost always equal to the previous record's X"
+   → P(X_n = X_{n-1}) ≈ 0.95
+   → Information content = -log₂(0.95) ≈ 0.074 bits per occurrence
+
+3. ASK: CAN THIS BE EXPLOITED?
+   If yes, what is the minimum representation?
+   What is the theoretical lower bound?
+
+4. DESIGN DATA STRUCTURES THAT MIRROR PROBLEM STRUCTURE
+   Not "what familiar structure fits here?"
+   But "what structure is most natural for this specific problem?"
+
+5. PROVE CORRECTNESS BEFORE IMPLEMENTING
+   At minimum: what invariants must always hold?
+   At maximum: formal proof that decode(encode(x)) == x
+
+6. IMPLEMENTATION IS TRANSLATION, NOT CREATION
+   If steps 1–5 are solid, implementation is mechanical.
+   If implementation feels hard, return to step 2.
+```
+
+---
+
+## THREE QUESTIONS THAT BREAK LIMITS
+
+**Question 1: What are the hidden assumptions of this algorithm?**
+Every algorithm assumes something about data or environment.
+Find those assumptions. Ask: if this assumption does not hold, what becomes possible?
+
+- Binary search assumes sorted data. If data has a different structure
+  (e.g., Gaussian distribution), interpolation search outperforms it.
+- Huffman coding assumes independent symbols. If symbols are correlated,
+  arithmetic coding with a context model is fundamentally better.
+- rANS assumes frequencies are known before encoding. If frequencies
+  shift as data streams, an adaptive model is more correct.
+
+**Question 2: Where does this algorithm discard information?**
+All algorithms have blindness — something they do not see.
+gzip does not know that `"user_001"` and `"user_002"` are the same counter.
+zstd does not know that a field is identical across 1000 records.
+Every blindness is an opportunity for a new algorithm.
+
+**Question 3: What is the theoretical lower bound?**
+Shannon entropy, Kolmogorov complexity, sorting lower bounds — these are
+fences that cannot be crossed. But they also reveal the distance between
+the best existing solution and what is *possible*.
+If gzip gives 30% and the theoretical minimum is 2%, there is 28% of
+unexploited structure. That gap is where new work lives.
+
+---
+
+## WHY MOST ENGINEERS DO NOT REACH THIS
+
+Not because of lack of intelligence. Because of:
+
+- **Deadline pressure** shrinks the horizon. "Make it work now" is the
+  enemy of "make it optimal." Creating new algorithms requires space
+  to ask questions without pressure for immediate answers.
+
+- **Comfort with tools reduces curiosity.** When something already works,
+  the mind stops asking why. Discomfort is the fuel of innovation.
+
+- **Mathematics treated as calculator, not language.** Engineers who create
+  algorithms use mathematics to *describe the structure of the problem*,
+  not merely to substitute values into formulas.
+
+- **If target is worse than gzip:** that is not failure — that is data.
+  A researcher is more interested in *why* the result is poor than when it
+  is good. From that answer, new hypotheses are born. The target is never
+  adjusted to match the result. The algorithm is adjusted to meet the target.
+
+---
+
 # USAGE EXAMPLE
 
 Task:
