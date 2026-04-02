@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "scte-core",
+    "scte-cli",
+]
+resolver = "2"

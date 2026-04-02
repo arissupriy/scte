@@ -1,0 +1,9 @@
+[package]
+name = "scte-core"
+version = "0.1.0"
+edition = "2021"
+description = "SCTE core engine — pure Rust, no I/O, no network"
+
+[dependencies]
+
+[dev-dependencies]
