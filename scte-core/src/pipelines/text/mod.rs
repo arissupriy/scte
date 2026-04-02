@@ -9,6 +9,9 @@ pub mod tokenizer;
 pub mod two_pass;
 pub(crate) mod value;
 
+pub use two_pass::{TwoPassOutput, encode_json_two_pass,
+                   schema_encode_tokens, schema_decode_tokens};
+
 pub use canonicalize::canonicalize_json;
 pub use columnar::{ColumnStream, ColumnValue, ColumnarBatch, is_homogeneous_array};
 pub use dictionary::{Dictionary, DictEntry, DictEntryKind, EncodedToken, EncodedPayload,
