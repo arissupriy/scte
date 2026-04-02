@@ -39,8 +39,12 @@ pub mod container;
 pub mod entropy;
 pub mod error;
 pub mod pipelines;
+pub mod schema;
 pub mod types;
 pub mod varint;
+
+// ── Pipeline trait + context types ──────────────────────────────────────────
+pub use pipelines::{Pipeline, DataClass, TextSubType, EncodeContext, DecodeContext, Encoded};
 
 // ── Top-level convenience re-exports ────────────────────────────────────────
 
@@ -94,11 +98,11 @@ pub use pipelines::text::decode_with_dict;
 
 /// Serialize a dictionary-encoded token stream to the TOKENS section payload
 /// (rANS-encoded kinds + varint/raw payloads).
-pub use entropy::encode_token_bytes;
+pub use pipelines::text::encode_token_bytes;
 
 /// Deserialize a TOKENS section payload back to a dictionary-encoded
 /// token stream.
-pub use entropy::decode_token_bytes;
+pub use pipelines::text::decode_token_bytes;
 
 /// Frequency table for the rANS entropy model.
 pub use entropy::FreqTable;
