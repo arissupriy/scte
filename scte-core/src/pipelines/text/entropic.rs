@@ -5,16 +5,19 @@
 /// - Mapping `TokenKind` ↔ `u8` (alphabet = 10 kinds, values 0..=9)
 /// - Serializing / deserializing per-token payloads (DictId, literals,
 ///   integers, floats, booleans)
-/// - Calling `entropy::codec::{encode, decode}` with `alphabet_size = 10`
+/// - Calling `entropy::codec::encode_auto` (Phase 7: auto-selects rANS or CTW)
 ///
 /// # Wire format (TOKENS section payload)
 /// ```text
-/// [entropy blob]    ← entropy::codec::encode(kind_bytes, 10)
-/// [payload stream]  ← one entry per token, in token order
+/// [kind blob]    ← encode_auto(kind_bytes, 10)   — self-delimiting
+/// [payload blob] ← 0x00 || raw_payload            — no further compression
+///                  0x04 || varint(len) || ctw_bytes — CTW compressed
 /// ```
 ///
-/// The entropy blob is self-contained (stores symbol_count + alphabet_size
-/// internally), so the payload stream starts immediately after.
+/// The kind blob is self-delimiting.  The payload blob's first byte is a
+/// codec tag: `0x00` = raw, `0x04` = CTW.  If the CTW output is not smaller
+/// than the raw payload (plus the 5-byte overhead for tag + varint), the raw
+/// path is always taken.
 ///
 /// # Payload encoding per kind
 ///
@@ -30,7 +33,7 @@
 /// | Bool              | 1 byte: 0x00 = false, 0x01 = true                   |
 
 use crate::{
-    entropy::codec as entropy_codec,
+    entropy::{codec as entropy_codec, ctw},
     error::ScteError,
     pipelines::text::{
         dictionary::{EncodedPayload, EncodedToken},
@@ -94,8 +97,8 @@ pub fn encode_token_bytes(tokens: &[EncodedToken]) -> Result<Vec<u8>, ScteError>
     // ── 1. extract kind stream ────────────────────────────────────────────────
     let kind_bytes: Vec<u8> = tokens.iter().map(|t| kind_to_byte(t.kind)).collect();
 
-    // ── 2. entropy-encode kind stream (generic, format-agnostic) ─────────────
-    let entropy_blob = entropy_codec::encode(&kind_bytes, TOKEN_KIND_ALPHABET)?;
+    // ── 2. entropy-encode kind stream — auto-selects rANS or CTW ────────────
+    let entropy_blob = entropy_codec::encode_auto(&kind_bytes, TOKEN_KIND_ALPHABET)?;
 
     // ── 3. serialize payloads ─────────────────────────────────────────────────
     let mut payload_buf: Vec<u8> = Vec::new();
@@ -103,10 +106,30 @@ pub fn encode_token_bytes(tokens: &[EncodedToken]) -> Result<Vec<u8>, ScteError>
         encode_payload(token, &mut payload_buf);
     }
 
-    // ── 4. concatenate ────────────────────────────────────────────────────────
-    let mut out = Vec::with_capacity(entropy_blob.len() + payload_buf.len());
+    // ── 4. compress payload blob — CTW if smaller, otherwise raw ─────────────
+    //  Tag 0x04 = CTW (SectionCodec::Arithmetic), 0x00 = raw (no overhead).
+    //  CTW overhead: 1 byte tag + up to 4 bytes varint(len) = 5 bytes.
+    const PAYLOAD_TAG_RAW: u8 = 0x00;
+    const PAYLOAD_TAG_CTW: u8 = 0x04;
+    const CTW_DEPTH: usize    = 8;
+    const CTW_OVERHEAD: usize = 5; // tag + varint(len)
+
+    let ctw_payload  = ctw::encode(&payload_buf, CTW_DEPTH);
+    let use_ctw      = ctw_payload.len() + CTW_OVERHEAD < payload_buf.len();
+
+    let mut out = Vec::with_capacity(
+        entropy_blob.len() + 1 + if use_ctw { 4 + ctw_payload.len() } else { payload_buf.len() }
+    );
     out.extend_from_slice(&entropy_blob);
-    out.extend_from_slice(&payload_buf);
+
+    if use_ctw {
+        out.push(PAYLOAD_TAG_CTW);
+        encode_usize(ctw_payload.len(), &mut out);
+        out.extend_from_slice(&ctw_payload);
+    } else {
+        out.push(PAYLOAD_TAG_RAW);
+        out.extend_from_slice(&payload_buf);
+    }
     Ok(out)
 }
 
@@ -148,11 +171,44 @@ fn encode_payload(token: &EncodedToken, out: &mut Vec<u8>) {
 pub fn decode_token_bytes(data: &[u8]) -> Result<Vec<EncodedToken>, ScteError> {
     let mut pos = 0;
 
-    // ── 1. decode kind stream (generic entropy codec) ─────────────────────────
-    let (kind_bytes, consumed) = entropy_codec::decode(data, pos)?;
+    // ── 1. decode kind stream — auto-detect rANS or CTW ──────────────────────
+    let (kind_bytes, consumed) = entropy_codec::decode_auto(data, pos)?;
     pos += consumed;
 
-    // ── 2. decode payloads ────────────────────────────────────────────────────
+    // ── 2. decode payload blob ────────────────────────────────────────────────
+    if pos >= data.len() {
+        return Err(ScteError::DecodeError(
+            "text/entropic: missing payload codec tag".into()));
+    }
+    let payload_tag = data[pos];
+    pos += 1;
+
+    let payload_data: Vec<u8> = match payload_tag {
+        0x00 => data[pos..].to_vec(),  // raw — remainder is payload
+        0x04 => {
+            // CTW — read varint(len) then decompress
+            let (blob_len, hdr) = crate::varint::decode_usize(data, pos)
+                .ok_or_else(|| ScteError::DecodeError(
+                    "text/entropic: truncated CTW payload length".into()))?;
+            pos += hdr;
+            if pos + blob_len > data.len() {
+                return Err(ScteError::DecodeError(
+                    "text/entropic: CTW payload blob truncated".into()));
+            }
+            let decompressed = ctw::decode(&data[pos..pos + blob_len])
+                .ok_or_else(|| ScteError::DecodeError(
+                    "text/entropic: CTW payload decode failed".into()))?;
+            pos += blob_len;
+            decompressed
+        }
+        tag => return Err(ScteError::DecodeError(
+            format!("text/entropic: unknown payload codec tag {tag:#04X}"))),
+    };
+    let payload = &payload_data;
+    let _ = pos; // pos no longer needed — all remaining work is on `payload`
+    let mut ppos = 0usize;
+
+    // ── 3. decode per-token payloads ──────────────────────────────────────────
     let mut tokens = Vec::with_capacity(kind_bytes.len());
     for (i, &kb) in kind_bytes.iter().enumerate() {
         let kind = byte_to_kind(kb).ok_or_else(|| {
@@ -161,9 +217,9 @@ pub fn decode_token_bytes(data: &[u8]) -> Result<Vec<EncodedToken>, ScteError> {
             ))
         })?;
 
-        let (payload, n) = decode_payload(kind, data, pos)?;
-        pos += n;
-        tokens.push(EncodedToken { kind, payload });
+        let (tok_payload, n) = decode_payload(kind, payload, ppos)?;
+        ppos += n;
+        tokens.push(EncodedToken { kind, payload: tok_payload });
     }
 
     Ok(tokens)

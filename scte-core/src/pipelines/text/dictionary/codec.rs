@@ -17,7 +17,7 @@ use crate::{
     pipelines::text::tokenizer::{Token, TokenKind, TokenPayload},
 };
 
-use super::{Dictionary, DictEntryKind};
+use super::Dictionary;
 
 // ── Encoded token types ───────────────────────────────────────────────────────
 

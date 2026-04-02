@@ -28,12 +28,22 @@
 
 use crate::{
     entropy::{
+        ctw,
         frequency::{FreqTable, DEFAULT_M_BITS},
         rans,
     },
     error::ScteError,
     varint::{decode_usize, encode_usize},
 };
+
+// ── Auto-codec constants ───────────────────────────────────────────────────────
+
+/// Wire tag: rANS 1st-order Markov (matches `SectionCodec::Rans = 0x01`).
+const TAG_RANS: u8 = 0x01;
+/// Wire tag: CTW arithmetic coding (matches `SectionCodec::Arithmetic = 0x04`).
+const TAG_CTW:  u8 = 0x04;
+/// CTW context depth used by `encode_auto`. 8 prior bits of context.
+const AUTO_CTW_DEPTH: usize = 8;
 
 /// Compress a raw symbol stream with rANS using a 1st-order context model.
 ///
@@ -197,6 +207,72 @@ pub fn decode(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), ScteError> {
     Ok((symbols, p - start))
 }
 
+// ── Auto-selecting encoder ────────────────────────────────────────────────────
+
+/// Encode `symbols` using whichever of rANS or CTW produces smaller output.
+///
+/// # Wire format
+/// ```text
+/// codec_tag (1 byte)
+///   0x01 (rANS): codec_tag || <rANS blob>         — self-delimiting
+///   0x04 (CTW):  codec_tag || varint(len) || <CTW blob>
+/// ```
+/// The tag byte matches [`crate::types::SectionCodec`] values so the section
+/// header can describe which codec was used without re-reading the payload.
+pub fn encode_auto(symbols: &[u8], alphabet_size: usize) -> Result<Vec<u8>, ScteError> {
+    let rans_bytes = encode(symbols, alphabet_size)?;
+    let ctw_bytes  = ctw::encode(symbols, AUTO_CTW_DEPTH);
+
+    if ctw_bytes.len() < rans_bytes.len() {
+        let mut out = Vec::with_capacity(1 + 4 + ctw_bytes.len());
+        out.push(TAG_CTW);
+        encode_usize(ctw_bytes.len(), &mut out);
+        out.extend_from_slice(&ctw_bytes);
+        Ok(out)
+    } else {
+        let mut out = Vec::with_capacity(1 + rans_bytes.len());
+        out.push(TAG_RANS);
+        out.extend_from_slice(&rans_bytes);
+        Ok(out)
+    }
+}
+
+/// Decode a blob produced by [`encode_auto`].
+///
+/// Returns `(symbols, bytes_consumed)`.  `bytes_consumed` includes the leading
+/// tag byte (and, for CTW, the length varint).
+///
+/// # Errors
+/// [`ScteError::DecodeError`] for unknown tag, truncated data, or CTW failure.
+pub fn decode_auto(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), ScteError> {
+    if pos >= data.len() {
+        return Err(ScteError::DecodeError(
+            "entropy/codec: truncated auto-codec tag".into()));
+    }
+    match data[pos] {
+        TAG_RANS => {
+            let (symbols, consumed) = decode(data, pos + 1)?;
+            Ok((symbols, 1 + consumed))
+        }
+        TAG_CTW => {
+            let (blob_len, hdr_sz) = decode_usize(data, pos + 1)
+                .ok_or_else(|| ScteError::DecodeError(
+                    "entropy/codec: truncated CTW blob length".into()))?;
+            let blob_start = pos + 1 + hdr_sz;
+            if blob_start + blob_len > data.len() {
+                return Err(ScteError::DecodeError(
+                    "entropy/codec: CTW blob truncated".into()));
+            }
+            let symbols = ctw::decode(&data[blob_start..blob_start + blob_len])
+                .ok_or_else(|| ScteError::DecodeError(
+                    "entropy/codec: CTW decode failed".into()))?;
+            Ok((symbols, 1 + hdr_sz + blob_len))
+        }
+        tag => Err(ScteError::DecodeError(
+            format!("entropy/codec: unknown codec tag {tag:#04X}"))),
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -280,5 +356,59 @@ mod tests {
     #[test]
     fn symbol_out_of_alphabet_returns_error() {
         assert!(encode(&[0, 1, 5], 3).is_err());
+    }
+
+    // ── encode_auto / decode_auto ─────────────────────────────────────────────
+
+    fn roundtrip_auto(symbols: &[u8], alphabet_size: usize) {
+        let blob = encode_auto(symbols, alphabet_size).expect("encode_auto failed");
+        let (decoded, consumed) = decode_auto(&blob, 0).expect("decode_auto failed");
+        assert_eq!(decoded.as_slice(), symbols, "roundtrip_auto mismatch");
+        assert_eq!(consumed, blob.len(), "consumed must equal blob len");
+    }
+
+    #[test]
+    fn auto_roundtrip_empty() { roundtrip_auto(&[], 4); }
+
+    #[test]
+    fn auto_roundtrip_uniform_10() {
+        let s: Vec<u8> = (0..500u16).map(|i| (i % 10) as u8).collect();
+        roundtrip_auto(&s, 10);
+    }
+
+    #[test]
+    fn auto_roundtrip_highly_skewed() {
+        // Very skewed → CTW should win.
+        let mut s = vec![0u8; 9000];
+        s.extend(vec![1u8; 1000]);
+        roundtrip_auto(&s, 10);
+    }
+
+    #[test]
+    fn auto_picks_smaller_codec() {
+        let s: Vec<u8> = (0..1000u16).map(|i| (i % 10) as u8).collect();
+        let auto  = encode_auto(&s, 10).unwrap().len();
+        let rans  = encode(&s, 10).unwrap().len();
+        let ctw   = ctw::encode(&s, AUTO_CTW_DEPTH).len();
+        // auto must be no worse than the smaller of the two (plus 1-byte tag).
+        let best  = rans.min(ctw) + 1;
+        assert!(auto <= best + 4,   // +4 = varint len header for CTW path
+            "auto={auto} should be close to best={best}");
+    }
+
+    #[test]
+    fn auto_decode_unknown_tag_errors() {
+        assert!(decode_auto(&[0xAB, 0x00], 0).is_err());
+    }
+
+    #[test]
+    fn auto_decode_at_nonzero_offset() {
+        let s: Vec<u8> = vec![0, 1, 2, 0, 1];
+        let mut data = vec![0xFF, 0xFF];
+        let blob = encode_auto(&s, 3).unwrap();
+        data.extend_from_slice(&blob);
+        let (decoded, consumed) = decode_auto(&data, 2).unwrap();
+        assert_eq!(decoded.as_slice(), s.as_slice());
+        assert_eq!(consumed, blob.len());
     }
 }
