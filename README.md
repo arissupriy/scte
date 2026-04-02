@@ -77,24 +77,61 @@ scte inspect output.scte
 
 ## Development Phases
 
-| Phase | Feature                        | Status      |
-|-------|--------------------------------|-------------|
-| 1     | Minimal core — container format| ✅ Complete  |
-| 2     | Text pipeline — JSON           | 🔄 Next     |
-| 3     | Dictionary encoding            | ⏳ Planned  |
-| 4     | Entropy coding (rANS)          | ⏳ Planned  |
-| 5     | Pipeline integration           | ⏳ Planned  |
-| 6     | Memory & zero-copy optimization| ⏳ Planned  |
-| 7     | C ABI / FFI layer              | ⏳ Planned  |
-| 8     | WASM binding                   | ⏳ Planned  |
+| Phase | Feature                        | Status        |
+|-------|--------------------------------|---------------|
+| 1     | Minimal core — container format| ✅ Complete    |
+| 2     | Text pipeline — JSON           | ✅ Complete    |
+| 3     | Dictionary encoding            | ✅ Complete    |
+| 4     | Entropy coding (rANS)          | 🔄 Next       |
+| 5     | Pipeline integration           | ⏳ Planned    |
+| 6     | Memory & zero-copy optimization| ⏳ Planned    |
+| 7     | C ABI / FFI layer              | ⏳ Planned    |
+| 8     | WASM binding                   | ⏳ Planned    |
+
+## Text Pipeline (Phase 2 & 3)
+
+The text pipeline processes JSON through four stages:
+
+```
+JSON bytes
+  → canonicalize_json()    — deterministic form, sorted keys, no whitespace
+  → tokenize_json()        — flat token stream (ObjOpen/Key/Str/NumInt/…)
+  → Dictionary::build()    — frequency analysis, token → u16 ID mapping
+  → encode_with_dict()     — high-frequency strings replaced by compact IDs
+```
+
+Stage output is stored in two SCTE sections:
+- `DICT (0x01)` — serialized dictionary (LEB128 wire format)
+- `TOKENS (0x02)` — dictionary-encoded token stream (Phase 4: rANS-coded)
+
+### Token kinds
+
+| Kind       | Description                              |
+|------------|------------------------------------------|
+| `ObjOpen`  | `{`                                      |
+| `ObjClose` | `}`                                      |
+| `ArrOpen`  | `[`                                      |
+| `ArrClose` | `]`                                      |
+| `Key`      | Object key string (dict-eligible)        |
+| `Str`      | String value (dict-eligible)             |
+| `NumInt`   | Integer-normalised number (i64)          |
+| `NumFloat` | Genuine floating-point (f64)             |
+| `Bool`     | `true` / `false`                         |
+| `Null`     | `null`                                   |
+
+### Dictionary properties
+- Max capacity: **65 535 entries** (u16 ID space)
+- Sort order: frequency descending; ties broken by `(kind, value)` byte order
+- `Key` and `Str` with the same string value get **separate** dictionary entries
+- Wire format: `varint(K)` + per entry: `type(1) + varint(len) + utf8_bytes`
 
 ---
 
-## Key Properties
+
 
 - **Lossless** — `decode(encode(x)) == x`, always, byte-identical
 - **Deterministic** — identical input + config = identical output across platforms
-- **Zero external dependencies** in `scte-core` (Phase 1)
+- **Zero external dependencies** in `scte-core` (Phases 1–3)
 - **Language-agnostic** — C ABI as the stable system boundary
 - **Mobile-ready** — designed for Dart FFI (Flutter) and WASM from the ground up
 
