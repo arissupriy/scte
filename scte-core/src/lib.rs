@@ -9,9 +9,14 @@
 /// │   ├── checksum — FNV-1a 32-bit (Phase 1); replaced by XXH3 in v2
 /// │   ├── header   — ScteHeader (24-byte wire format)
 /// │   └── section  — SectionEntry (per-section table entry)
-/// └── codec
-///     ├── encoder  — encode(&[u8]) → Vec<u8>
-///     └── decoder  — decode(&[u8]) → Result<Vec<u8>, ScteError>
+/// ├── codec
+/// │   ├── encoder  — encode(&[u8]) → Vec<u8>
+/// │   └── decoder  — decode(&[u8]) → Result<Vec<u8>, ScteError>
+/// └── pipelines
+///     └── text
+///         ├── value        — JSON Value IR + recursive descent parser
+///         ├── canonicalize — canonical JSON serializer
+///         └── tokenizer    — flat token stream from JSON
 /// ```
 ///
 /// # SDK usage
@@ -26,6 +31,7 @@
 pub mod codec;
 pub mod container;
 pub mod error;
+pub mod pipelines;
 pub mod types;
 
 // ── Top-level convenience re-exports ────────────────────────────────────────
@@ -53,3 +59,12 @@ pub use types::SectionType;
 
 /// Section codec code.
 pub use types::SectionCodec;
+
+/// Canonicalize JSON bytes to deterministic compact form.
+pub use pipelines::text::canonicalize_json;
+
+/// Parse JSON bytes into a flat token stream.
+pub use pipelines::text::tokenize_json;
+
+/// A single token in the text pipeline token stream.
+pub use pipelines::text::{Token, TokenKind, TokenPayload};
