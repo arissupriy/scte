@@ -65,9 +65,9 @@ pub enum SectionType {
     Dict   = 0x01,
     /// Token stream output of the text pipeline.
     Tokens = 0x02,
-    /// Delta ops (future binary pipeline).
+    /// Delta ops — cross-record delta + pattern encoding (Phase 6).
     Delta  = 0x03,
-    /// New chunk payloads (future binary pipeline).
+    /// New chunk payloads (binary pipeline, Phase 3).
     Chunks = 0x04,
     /// Hash → file-offset index.
     Index  = 0x05,
@@ -75,6 +75,8 @@ pub enum SectionType {
     Data   = 0x06,
     /// File-level metadata (original name, mtime, etc.).
     Meta   = 0x07,
+    /// Inferred field schema — field types, enum mappings, encoding hints (Phase 5).
+    Schema = 0x08,
 }
 
 impl SectionType {
@@ -87,6 +89,7 @@ impl SectionType {
             0x05 => Some(Self::Index),
             0x06 => Some(Self::Data),
             0x07 => Some(Self::Meta),
+            0x08 => Some(Self::Schema),
             _    => None,
         }
     }
@@ -99,13 +102,15 @@ impl SectionType {
 #[repr(u8)]
 pub enum SectionCodec {
     /// No transformation — raw bytes.  ← Phase 1 uses only this.
-    None   = 0x00,
+    None       = 0x00,
     /// Range Asymmetric Numeral Systems (custom rANS).  ← Phase 4+
-    Rans   = 0x01,
+    Rans       = 0x01,
     /// Zstd compression.
-    Zstd   = 0x02,
+    Zstd       = 0x02,
     /// LEB128 varint stream.  ← Phase 3+
-    Varint = 0x03,
+    Varint     = 0x03,
+    /// High-precision arithmetic coding — used when P(symbol) > 0.99 (Phase 7).
+    Arithmetic = 0x04,
 }
 
 impl SectionCodec {
@@ -115,6 +120,7 @@ impl SectionCodec {
             0x01 => Some(Self::Rans),
             0x02 => Some(Self::Zstd),
             0x03 => Some(Self::Varint),
+            0x04 => Some(Self::Arithmetic),
             _    => None,
         }
     }
