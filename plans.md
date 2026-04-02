@@ -143,11 +143,12 @@ Offset  Size  Field      Description
 ```
 0x01  DICT    global dictionary
 0x02  TOKENS  token stream (text pipeline output)
-0x03  DELTA   delta ops (future)
+0x03  DELTA   delta ops — cross-record delta + pattern encoding (Phase 6)
 0x04  CHUNKS  new chunk data (binary pipeline)
 0x05  INDEX   hash → offset index
 0x06  DATA    raw or secondary-compressed payload
 0x07  META    file-level metadata (original filename, mtime, etc.)
+0x08  SCHEMA  inferred field schema — field types, enum mappings, encoding hints (Phase 5)
 ```
 
 ### 4.5 Section Codecs
@@ -157,6 +158,7 @@ Offset  Size  Field      Description
 0x01  rANS
 0x02  Zstd
 0x03  LEB128-varint stream
+0x04  Arithmetic  — high-precision arithmetic coding, used when P(symbol) > 0.99 (Phase 7)
 ```
 
 ### 4.6 Integrity
@@ -270,6 +272,10 @@ col "key": ["alice", "bob"...] → dict lookup or RLE
 Column-oriented layout drastically reduces entropy per-column since values
 within a column are from the same distribution.
 
+**Note**: Columnarization adalah fondasi langsung untuk Phase 6 (delta + pattern encoding).
+Setelah kolom dipisah, delta encoding per kolom integer menjadi trivial dan sangat efektif.
+Implementasi Phase 2 harus menjaga antarmuka yang kompatibel dengan Phase 6 delta encoder.
+
 ### 5.6 Stage 5 — Dictionary Building
 
 Single-pass frequency count over all tokens.
@@ -305,6 +311,13 @@ then ZigZag + varint
 
 For float values: store as IEEE 754 f32 or f64 based on precision analysis.
 If value fits in f32 without loss → use f32 (saves 4 bytes per value).
+
+**Phase boundary note**:
+- Phase 1-2: ZigZag + varint flat (implementasi saat ini)
+- Phase 6: tambah delta pattern detection (sequential/monotonic/clustered) per kolom
+- Phase 6: tambah cross-record reference (field sama dengan record sebelumnya → 1 bit)
+- Antarmuka `NumericEncoder` harus didesain extensible dari Phase 2 agar Phase 6
+  bisa plug in tanpa refactor besar.
 
 ### 5.8 Stage 7 — Entropy Coding (rANS)
 
@@ -462,9 +475,18 @@ scte/
 │       │   │   ├── canonicalize.rs
 │       │   │   ├── tokenizer.rs
 │       │   │   ├── dictionary.rs
+│       │   │   ├── entropic.rs         (JSON token entropy codec — format-specific)
 │       │   │   ├── path_flatten.rs
 │       │   │   ├── columnar.rs
-│       │   │   └── numeric.rs
+│       │   │   ├── numeric.rs
+│       │   │   ├── two_pass.rs         (Phase 5: analyze → encode orchestrator)
+│       │   │   ├── delta/              (Phase 6)
+│       │   │   │   ├── integer.rs      (sequential/monotonic/clustered detection)
+│       │   │   │   ├── timestamp.rs    (ISO8601 → epoch delta → varint)
+│       │   │   │   └── cross_record.rs (field same_as_prev model)
+│       │   │   └── pattern/            (Phase 6)
+│       │   │       ├── string_prefix.rs (prefix template detection)
+│       │   │       └── rle.rs           (run-length encoding)
 │       │   ├── zstd_fallback.rs    (official fallback pipeline 0xFE)
 │       │   ├── passthrough.rs      (high entropy 0xFF)
 │       │   ├── binary_stub.rs
@@ -472,7 +494,15 @@ scte/
 │       ├── entropy/
 │       │   ├── rans.rs             (rANS encode/decode)
 │       │   ├── frequency.rs        (frequency table builder + normalizer)
-│       │   └── varint.rs           (LEB128 + ZigZag)
+│       │   ├── codec.rs            (generic byte-stream entropy codec — format-agnostic)
+│       │   ├── arithmetic.rs       (Phase 7: high-precision arithmetic coding)
+│       │   ├── ctw.rs              (Phase 7: Context Tree Weighting)
+│       │   └── context.rs          (Phase 7: context builder — path+value+schema)
+│       ├── varint.rs               (LEB128 + ZigZag)
+│       ├── schema/                 (Phase 5)
+│       │   ├── inferencer.rs       (scan tokens → FieldSchema[])
+│       │   ├── field_type.rs       (Integer/Float/Bool/Enum/Str/Timestamp)
+│       │   └── serializer.rs       (FieldSchema → SCHEMA section bytes)
 │       └── router.rs
 │
 ├── scte-client/
@@ -676,11 +706,16 @@ are deferred to Phase 3.
 ### Phase 2 — Stateful + Extended Text (Target: +3 weeks)
 
 **Goals:**
-- CSV columnarization
+- CSV columnarization — pisahkan per kolom, siapkan antarmuka extensible untuk Phase 6
 - XML support
 - Stateful mode: server negotiation + dictionary cache
 - `scte-server`: Axum-based, minimal storage backend
 - `scte-client`: negotiator + HTTP transport
+
+**Design constraint untuk Phase 6 compatibility**:
+- `columnar.rs` harus expose `ColumnStream { field_path, values: Vec<EncodedValue> }`
+- `numeric.rs` harus expose trait `IntegerEncoder` yang bisa di-swap ke delta encoder di Phase 6
+- Jangan hardcode flat ZigZag sebagai satu-satunya path — buat extensible dari awal
 
 **Milestone**: second upload of same-schema JSON uses cached dictionary,
 encoding 30%+ faster than first upload.
@@ -709,7 +744,8 @@ Flutter app can encode/decode via Dart FFI without any Rust toolchain.
 
 **Goals:**
 - SIMD-optimized rANS (x86_64 + aarch64)
-- Adaptive frequency model (dynamic f_i(t) update)
+- Adaptive frequency model: perbarui f_i secara runtime saat encode berjalan
+  (berbeda dari Phase 5 schema inference — ini adaptasi in-stream, bukan two-pass)
 - DOCX/XLSX container pipeline
 - Distributed server (Redis chunk index)
 - Format versioning + backward compatibility test suite
@@ -718,6 +754,211 @@ Flutter app can encode/decode via Dart FFI without any Rust toolchain.
 
 **Milestone**: end-to-end decode throughput > 500 MB/s on modern hardware.
 Same `.scte` file decodable from Rust CLI, Flutter app, Node.js, and Python.
+
+---
+
+### Phase 5 — Schema Inference + Two-Pass Encoding (Target: +3 months)
+
+**Tujuan**: melampaui zstd/gzip untuk semua data terstruktur tanpa pretrained model,
+murni dari analisa data itu sendiri.
+
+**Konsep utama**: dua pass — Pass 1 pelajari distribusi, Pass 2 encode dengan model itu.
+Model disimpan di header file `.scte`, decoder rebuild model dari header → lossless sempurna.
+
+**Goals:**
+- Schema inferencer otomatis: scan seluruh file → ekstrak field schema
+  - Deteksi tipe per field: integer / float / bool / enum / string / timestamp
+  - Deteksi enum otomatis: field dengan ≤ N nilai unik → simpan sebagai mapping 2-bit
+  - Deteksi distribusi per field: histogram frekuensi nilai
+- Two-pass orchestrator:
+  - Pass 1 (analyze): scan file → bangun `FileSchema` (tidak output apapun)
+  - Pass 2 (encode): encode dengan `FileSchema` yang sudah terbentuk
+- `FileSchema` serialization: disimpan di section baru `SCHEMA (0x08)` dalam container
+- Encoder menggunakan distribusi per-field dari Pass 1 → rANS jauh lebih akurat
+
+**Komponen baru di `scte-core/src/`:**
+
+```
+pipelines/text/
+├── schema/
+│   ├── inferencer.rs     — scan token stream → FieldSchema[]
+│   ├── field_type.rs     — enum: Integer, Float, Bool, Enum, Str, Timestamp
+│   └── serializer.rs     — FieldSchema → bytes (untuk section SCHEMA)
+├── two_pass.rs           — orchestrator: analyze → encode
+```
+
+**Wire format baru — Section SCHEMA (0x08):**
+
+```
+varint(field_count)
+for each field:
+    varint(path_id)          — referensi ke DICT
+    u8(field_type)           — Integer=0, Float=1, Bool=2, Enum=3, Str=4, Timestamp=5
+    if Enum:
+        varint(variant_count)
+        for each variant: varint(len) + utf8_bytes
+    if Integer/Timestamp:
+        u8(encoding_hint)    — Flat=0, Delta=1, Sequential=2
+```
+
+**Target rasio:**
+
+| Data | Phase 4 (sekarang) | Phase 5 (target) |
+|------|-------------------|-----------------|
+| 500 API records homogen | ~20% | ~10-15% |
+| 500 log lines (enum dominan) | ~25% | ~5-10% |
+| CSV 10 kolom, 10K rows | ~30% | ~8-15% |
+
+**Milestone**: untuk dataset dengan ≥ 3 enum fields, rasio < 15% dari raw.
+Lebih baik dari `zstd --level 19` pada semua dataset JSON/log terstruktur.
+
+---
+
+### Phase 6 — Delta + Pattern Encoding (Target: +2 bulan setelah Phase 5)
+
+**Tujuan**: kompres integer sequences dan string patterns mendekati entropy teoritis,
+tanpa model eksternal apapun.
+
+**Bottleneck yang diselesaikan**: saat ini integer `id` seperti 0,1,2,...,499 masing-masing
+disimpan flat (ZigZag LEB128). Padahal informasi nyatanya nyaris nol — semua predictable.
+
+**Goals:**
+
+**Delta encoding per integer field:**
+```
+Sequential:   0,1,2,3,4,5      → delta=+1 konstan → 0 bit/value setelah header
+Monotonic:    100,103,107,112  → delta kecil → ZigZag(delta) jauh lebih kecil
+Clustered:    50,51,50,52,51  → delta ±1-2 → 2-3 bit/value vs 8+ bit flat
+Random:       394,12,8821,44  → fallback ke flat encoding
+```
+
+**Cross-record reference model:**
+```
+Record N:   {"ip":"192.168.1.1", "user":"alice", "status":"ok"}
+Record N+1: {"ip":"192.168.1.1", "user":"alice", "status":"error"}
+
+Encoder cek setiap field vs record sebelumnya:
+  ip     → SAMA → encode sebagai "same_as_prev" = 1 bit
+  user   → SAMA → encode sebagai "same_as_prev" = 1 bit
+  status → BEDA → encode nilai baru: "error" (enum, 1 bit)
+Total: 3 bit vs ~60 byte = 0.6% dari raw → 99.4% savings
+```
+
+**String pattern encoder:**
+```
+Prefix pattern:   "user_001","user_002" → template="user_$" + counter=1,2
+Timestamp delta:  "2026-04-02T10:00:00","2026-04-02T10:00:03" → +3 detik
+Repeated value:   "admin","admin","admin" → RLE atau cross-record ref
+```
+
+**Komponen baru:**
+
+```
+pipelines/text/
+├── delta/
+│   ├── integer.rs        — sequential/monotonic/clustered detection + encode
+│   ├── timestamp.rs      — ISO8601 → epoch delta → varint
+│   └── cross_record.rs   — field-level same_as_prev model
+├── pattern/
+│   ├── string_prefix.rs  — prefix template detection
+│   └── rle.rs            — run-length encoding untuk nilai berulang
+```
+
+**Target rasio:**
+
+| Data | Phase 5 | Phase 6 (target) |
+|------|---------|-----------------|
+| Log dengan sequential id | ~12% | ~3-6% |
+| API response (5 field tetap, 1 berubah) | ~15% | ~1-4% |
+| IoT sensor (timestamp+value) | ~10% | ~1-3% |
+| CSV dengan id kolom | ~12% | ~2-5% |
+
+**Milestone**: dataset log server (id sequential + enum fields) → rasio < 5% dari raw.
+Unggul 3-10× dari `zstd --level 22`.
+
+---
+
+### Phase 7 — High-Order Context Model: CTW (Target: +3 bulan setelah Phase 6)
+
+**Tujuan**: mencapai mendekati entropy teoritis untuk semua data terstruktur,
+tanpa model eksternal. Ini ceiling kompresi tanpa pretrained.
+
+**Algoritma inti: Context Tree Weighting (CTW)**
+
+CTW adalah algoritma yang secara matematis terbukti *optimal* — seiring data
+bertambah, ia mencapai entropy Shannon per konteks. Tidak ada algoritma lossless
+tanpa pretrained yang bisa melampaui CTW secara teori.
+
+```
+Sekarang (Markov order-1):
+  Context = [kind_token_sebelumnya]   (10 kemungkinan)
+  Predict: kind token berikutnya
+
+CTW (order-N):
+  Context = [field_path + recent_values + schema_position + ...]
+  Depth:    sampai order-16 atau lebih
+  Predict: token berikutnya dengan probabilitas sangat tinggi
+  Fallback: jika konteks belum pernah dilihat → parent context (graceful)
+```
+
+**Goals:**
+- Implementasi CTW tree dengan depth adaptif
+- Konteks diperluas: bukan hanya kind, tapi (field_path, value_history, record_position)
+- Arithmetic coding presisi tinggi menggantikan rANS untuk distribusi sangat skewed
+  - rANS dengan M=2^16 tidak efisien untuk P(x) > 0.999
+  - Arithmetic coding: precision = arbitrary → bits per symbol → 0 jika P → 1
+- CTW model tumbuh online dari data itu sendiri (tidak ada training eksternal)
+- Model tersimpan di header (serialized CTW trie) → decoder rebuild identik
+
+**Komponen baru:**
+
+```
+entropy/
+├── ctw.rs            — Context Tree Weighting implementation
+├── arithmetic.rs     — Arithmetic coding presisi tinggi (ganti rANS untuk extreme prob)
+└── context.rs        — Context builder: (path, value_history, schema) → context_key
+```
+
+**Perbandingan coding layer:**
+
+```
+Distribusi        rANS (M=2^16)         Arithmetic coding
+──────────────────────────────────────────────────────────
+P(x) = 0.5       0.50 bits/sym    ≈    1.00 bits/sym  (sama)
+P(x) = 0.9       0.15 bits/sym    ≈    0.15 bits/sym  (sama)
+P(x) = 0.999     0.004 bits/sym   ≈    0.001 bits/sym (aritmetik lebih baik)
+P(x) = 0.9999    ~0.001 bits/sym  ≈    0.0001 bits/sym (aritmetik 10× lebih baik)
+```
+
+**Target rasio:**
+
+| Data | Phase 6 | Phase 7 (target) | Teoritis minimum |
+|------|---------|-----------------|-----------------|
+| Log server (sequential + enum) | ~4% | ~0.5-1.5% | ~0.1% |
+| API response homogen | ~3% | ~0.3-1% | ~0.05% |
+| CSV tabular (10 kolom) | ~4% | ~0.5-2% | ~0.2% |
+| Mixed/arbitrary text | ~18% | ~10-15% | ~8% |
+
+**Milestone**: log server dataset 10MB → output < 150KB (< 1.5% dari raw).
+Untuk data in-domain, hasil setara atau melebihi `PAQ8` (state-of-the-art
+non-neural compressor) tanpa model eksternal.
+
+---
+
+### Ringkasan Target Rasio Per Phase (data homogen terstruktur)
+
+```
+Phase 4 (sekarang):   20-36%   │████████████████████│
+Phase 5:              8-15%    │████████             │
+Phase 6:              2-6%     │████                 │
+Phase 7:              0.5-2%   │██                   │
+Teoritis minimum:     0.05-0.5%│█                    │
+─────────────────────────────────────────────────────
+Kompetitor TERBAIK (zstd-22):  8-15% (tidak semantic-aware)
+```
+
+**Semua phase di atas: zero external model, zero training data, pure Rust,
+deterministic, lossless.**
 
 ---
 
