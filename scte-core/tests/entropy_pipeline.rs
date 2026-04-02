@@ -191,3 +191,45 @@ fn unicode_strings_preserved() {
     let orig = tokenize_json(json.as_bytes()).unwrap();
     assert_eq!(full_roundtrip(json), orig);
 }
+
+#[test]
+fn print_compression_ratios() {
+    use scte_core::{canonicalize_json, Dictionary};
+    fn measure(label: &str, json: &str, min_freq: u32) {
+        let canon = canonicalize_json(json.as_bytes()).unwrap();
+        let toks  = tokenize_json(&canon).unwrap();
+        let dict  = Dictionary::build(&toks, min_freq);
+        let enc   = encode_with_dict(&toks, &dict);
+        let bytes = encode_token_bytes(&enc).unwrap();
+        let raw   = json.len();
+        let scte  = bytes.len();
+        println!("  {label:45} raw={raw:7}B  scte={scte:7}B  {:.1}%",
+                 scte as f64 / raw as f64 * 100.0);
+    }
+
+    println!("\n=== SCTE Compression Ratios ===");
+    measure("tiny object",
+        r#"{"id":1,"name":"Alice","active":true}"#, 1);
+
+    let mut j50 = String::from("[");
+    for i in 0..50 { if i>0{j50.push(',');} j50.push_str(&format!(r#"{{"id":{i},"name":"user_{i}","role":"admin","active":true}}"#)); }
+    j50.push(']');
+    measure("50 uniform records", &j50, 2);
+
+    let mut j500 = String::from("[");
+    for i in 0..500 { if i>0{j500.push(',');} j500.push_str(&format!(r#"{{"id":{i},"name":"user_{i}","role":"admin","active":true}}"#)); }
+    j500.push(']');
+    measure("500 uniform records", &j500, 2);
+
+    let mut j2k = String::from("[");
+    for i in 0..2000 { if i>0{j2k.push(',');} j2k.push_str(&format!(r#"{{"id":{i},"name":"user_{i}","role":"admin","active":true}}"#)); }
+    j2k.push(']');
+    measure("2000 uniform records", &j2k, 2);
+
+    let mut jrep = String::from("[");
+    for i in 0..500 { if i>0{jrep.push(',');} jrep.push_str(&format!(r#"{{"type":"event","status":"ok","code":200,"msg":"success","id":{i}}}"#)); }
+    jrep.push(']');
+    measure("500 repetitive API responses", &jrep, 2);
+
+    println!("===============================");
+}
