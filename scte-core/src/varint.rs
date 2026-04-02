@@ -99,6 +99,54 @@ pub fn decode_usize(data: &[u8], pos: usize) -> Option<(usize, usize)> {
     Some((n, consumed))
 }
 
+// ── ZigZag signed integer encoding ───────────────────────────────────────────
+
+/// ZigZag-encode a signed `i64` to an unsigned `u64`.
+///
+/// Maps signed integers to non-negative integers:
+///
+/// |  i64 |  u64 |
+/// |------|------|
+/// |    0 |    0 |
+/// |   -1 |    1 |
+/// |    1 |    2 |
+/// |   -2 |    3 |
+/// |    2 |    4 |
+///
+/// Combined with LEB128 this makes small-magnitude negative numbers compact.
+///
+/// Formula: `(n << 1) ^ (n >> 63)`
+#[inline]
+pub fn zigzag_encode(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+/// Decode a ZigZag-encoded `u64` back to `i64`.
+///
+/// Formula: `(n >> 1) ^ -(n & 1)`
+#[inline]
+pub fn zigzag_decode(n: u64) -> i64 {
+    ((n >> 1) as i64) ^ -((n & 1) as i64)
+}
+
+/// Append a ZigZag + LEB128 encoding of `value` to `out`.
+///
+/// Encodes small-magnitude signed integers compactly:
+/// values in `[-64, 63]` → 1 byte, `[-8192, 8191]` → 2 bytes, etc.
+#[inline]
+pub fn encode_i64(value: i64, out: &mut Vec<u8>) {
+    encode_u64(zigzag_encode(value), out);
+}
+
+/// Decode one ZigZag + LEB128 `i64` from `data[pos..]`.
+///
+/// Returns `(value, bytes_consumed)` or `None` on error.
+#[inline]
+pub fn decode_i64(data: &[u8], pos: usize) -> Option<(i64, usize)> {
+    let (raw, consumed) = decode_u64(data, pos)?;
+    Some((zigzag_decode(raw), consumed))
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -226,5 +274,60 @@ mod tests {
         let (val, consumed) = decode_usize(&buf, 0).unwrap();
         assert_eq!(val, 65535);
         assert_eq!(consumed, buf.len());
+    }
+
+    // ── ZigZag ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn zigzag_zero() {
+        assert_eq!(zigzag_encode(0), 0);
+        assert_eq!(zigzag_decode(0), 0);
+    }
+
+    #[test]
+    fn zigzag_positive() {
+        assert_eq!(zigzag_encode(1),  2);
+        assert_eq!(zigzag_encode(2),  4);
+        assert_eq!(zigzag_encode(63), 126);
+    }
+
+    #[test]
+    fn zigzag_negative() {
+        assert_eq!(zigzag_encode(-1), 1);
+        assert_eq!(zigzag_encode(-2), 3);
+        assert_eq!(zigzag_encode(i64::MIN), u64::MAX);
+    }
+
+    #[test]
+    fn zigzag_roundtrip_positive() {
+        for n in [0i64, 1, 2, 127, 128, 1000, i64::MAX] {
+            assert_eq!(zigzag_decode(zigzag_encode(n)), n, "failed for {n}");
+        }
+    }
+
+    #[test]
+    fn zigzag_roundtrip_negative() {
+        for n in [-1i64, -2, -128, -129, -1000, i64::MIN] {
+            assert_eq!(zigzag_decode(zigzag_encode(n)), n, "failed for {n}");
+        }
+    }
+
+    #[test]
+    fn encode_i64_small_negative_is_compact() {
+        // -1 → ZigZag 1 → 1 byte LEB128
+        let mut buf = Vec::new();
+        encode_i64(-1, &mut buf);
+        assert_eq!(buf, [0x01]);
+    }
+
+    #[test]
+    fn encode_decode_i64_roundtrip() {
+        for n in [0i64, 1, -1, 127, -128, 1000, -1000, i64::MAX, i64::MIN] {
+            let mut buf = Vec::new();
+            encode_i64(n, &mut buf);
+            let (decoded, consumed) = decode_i64(&buf, 0).unwrap();
+            assert_eq!(decoded, n, "roundtrip failed for {n}");
+            assert_eq!(consumed, buf.len(), "consumed mismatch for {n}");
+        }
     }
 }
