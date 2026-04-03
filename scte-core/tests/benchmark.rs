@@ -1,10 +1,12 @@
-/// Phase 1 benchmark — SCTE vs zstd level 3 / level 19
+/// SCTE encoding benchmark.
 ///
 /// Run with:
-///   cargo test --test benchmark -- --nocapture
+///   cargo test --test benchmark benchmark_summary -- --nocapture
 ///
-/// Requires `zstd` binary on PATH.
+/// Requires `zstd` binary on PATH (used as a reference point — no claims are made).
+/// All rows verify: decode(encode(input)) == input (canonical JSON comparison).
 
+use std::path::Path;
 use std::process::Command;
 use scte_core::{encode, decode, canonicalize_json};
 
@@ -100,12 +102,52 @@ fn gen_api_json_random(n: usize, seed: u64) -> Vec<u8> {
     s.into_bytes()
 }
 
-// ── zstd helper ───────────────────────────────────────────────────────────────
+/// Semi-structured realistic API payload.
+/// Mixed: categorical fields use small vocabulary (partially periodic-ish),
+/// IDs are sequential, latencies/trace IDs are random, timestamps are sequential.
+/// Models real-world service-mesh telemetry where schema is regular but values vary.
+fn gen_api_json_semi(n: usize, seed: u64) -> Vec<u8> {
+    let services = ["auth", "payment", "inventory", "search",
+                    "recommendation", "notification", "analytics", "gateway"];
+    let envs  = ["prod", "staging", "canary"];
+    let dcs   = ["us-east-1a", "us-east-1b", "eu-west-1a", "eu-west-1b",
+                 "ap-southeast-1a", "us-west-2a"];
+    // Status code distribution biased heavily toward 200
+    let codes = [200u16, 200, 200, 200, 200, 201, 204,
+                 400, 401, 403, 404, 429, 500, 502, 503];
+    let mut s = String::with_capacity(n * 200);
+    s.push('[');
+    let mut lcg = seed;
+    for i in 0..n {
+        if i > 0 { s.push(','); }
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let svc  = services[(lcg >> 33) as usize % services.len()];
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let env  = envs[(lcg >> 33) as usize % envs.len()];
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let dc   = dcs[(lcg >> 33) as usize % dcs.len()];
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let code = codes[(lcg >> 33) as usize % codes.len()];
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let lat  = (lcg >> 20) % 2000 + 10;    // 10–2009 ms, unique per row
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let trace_lo = lcg & 0x0000_ffff_ffff_ffff;  // 48-bit random suffix
+        // Timestamp: sequential seconds from 2026-04-03 00:00:00 UTC — NOT cycling
+        let ts_sec  = 1_743_724_800u64 + i as u64;
+        let ts_frac = (lcg >> 10) % 1000;
+        s.push_str(&format!(
+            r#"{{"seq":{i},"service":"{svc}","env":"{env}","dc":"{dc}","status":{code},"latency_ms":{lat},"trace_id":"scte-{trace_lo:012x}","ts":{ts_sec}.{ts_frac:03}}}"#
+        ));
+    }
+    s.push(']');
+    s.into_bytes()
+}
 
-/// Compress `data` with `zstd` at the given level using the CLI binary.
-/// Returns compressed length (or panics with a descriptive message if zstd is
-/// not found on PATH).
-fn zstd_compress(data: &[u8], level: i32) -> usize {
+// ── zstd reference ───────────────────────────────────────────────────────────
+
+/// Returns compressed byte count using the `zstd` CLI at the given level.
+/// Used as a reference data point only — no comparative claims are made.
+fn zstd_len(data: &[u8], level: i32) -> usize {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -115,143 +157,174 @@ fn zstd_compress(data: &[u8], level: i32) -> usize {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("zstd not found — install zstd on PATH");
+        .expect("zstd not found on PATH");
 
     child.stdin.take().unwrap().write_all(data).unwrap();
     let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "zstd exited non-zero");
+    assert!(out.status.success());
     out.stdout.len()
 }
 
-// ── Benchmark helper ──────────────────────────────────────────────────────────
+// ── Row printer ─────────────────────────────────────────────────────────────
 
-/// Print one benchmark row and assert roundtrip correctness.
-fn bench(label: &str, data: &[u8]) {
+/// Self-calibrating timing: runs `op` once to measure single-iteration cost,
+/// then repeats enough times to fill `target_ms` milliseconds.
+/// Returns (total iterations, elapsed_secs).
+fn calibrated_time<F: FnMut()>(mut op: F, target_ms: u64) -> (usize, f64) {
+    use std::time::Instant;
+    // Single warmup + timing
+    let t0 = Instant::now();
+    op();
+    let single_ns = t0.elapsed().as_nanos().max(1);
+    // How many more to reach target?
+    let target_ns = (target_ms as u128) * 1_000_000;
+    let extra = ((target_ns / single_ns) as usize).max(0).min(200);
+    for _ in 0..extra { op(); }
+    let total_iters = 1 + extra;
+    let total_secs  = t0.elapsed().as_secs_f64(); // warmup + extra iters
+    (total_iters, total_secs)
+}
+
+/// Encode, verify roundtrip, measure throughput, print one result row.
+fn measure(label: &str, data: &[u8]) {
     let raw = data.len();
 
-    // SCTE encode
-    let encoded    = encode(data).expect("scte encode failed");
-    let scte_len   = encoded.len();
-    let scte_ratio = scte_len as f64 / raw as f64 * 100.0;
+    // ── encode throughput (self-calibrated to ~300 ms) ────────────────────────
+    let mut last_encoded: Vec<u8> = Vec::new();
+    let (enc_n, enc_secs) = calibrated_time(
+        || { last_encoded = encode(data).expect("scte encode"); },
+        300,
+    );
+    let encoded  = last_encoded;
+    let enc_len  = encoded.len();
+    let enc_pct  = enc_len as f64 / raw as f64 * 100.0;
+    let enc_mbs  = raw as f64 * enc_n as f64 / enc_secs / 1_048_576.0;
 
-    // Roundtrip verify (pipeline canonicalises key order)
+    // ── roundtrip verify ──────────────────────────────────────────────────────
     let decoded   = decode(&encoded).expect("scte decode failed");
     let canon_in  = canonicalize_json(data)    .expect("canonicalize input");
     let canon_out = canonicalize_json(&decoded).expect("canonicalize decoded");
-    assert_eq!(canon_in, canon_out, "ROUNDTRIP MISMATCH for '{label}'");
+    assert_eq!(canon_in, canon_out, "ROUNDTRIP MISMATCH: {label}");
 
-    // zstd baselines
-    let zstd3_len    = zstd_compress(data, 3);
-    let zstd19_len   = zstd_compress(data, 19);
-    let zstd3_ratio  = zstd3_len  as f64 / raw as f64 * 100.0;
-    let zstd19_ratio = zstd19_len as f64 / raw as f64 * 100.0;
+    // ── decode throughput (self-calibrated to ~300 ms) ────────────────────────
+    let (dec_n, dec_secs) = calibrated_time(
+        || { let _ = decode(&encoded).unwrap(); },
+        300,
+    );
+    let dec_mbs = enc_len as f64 * dec_n as f64 / dec_secs / 1_048_576.0;
 
-    let beats = if scte_len < zstd3_len { "✓" } else { " " };
+    let z3  = zstd_len(data, 3);
+    let z19 = zstd_len(data, 19);
+    let z3_pct  = z3  as f64 / raw as f64 * 100.0;
+    let z19_pct = z19 as f64 / raw as f64 * 100.0;
+
     println!(
-        "  {label:<45}  {raw:>9}B  {scte_len:>7}B {scte_ratio:5.1}%  \
-         {zstd3_len:>7}B {zstd3_ratio:5.1}%  \
-         {zstd19_len:>7}B {zstd19_ratio:5.1}%  {beats}"
+        "  {label:<48}  {raw:>10}B  {enc_len:>8}B {enc_pct:5.1}%  \
+         {enc_mbs:>7.1} MB/s  {dec_mbs:>7.1} MB/s  \
+         {z3:>8}B {z3_pct:5.1}%  {z19:>8}B {z19_pct:5.1}%"
     );
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── Individual tests ──────────────────────────────────────────────────────────
 
 #[test]
-fn benchmark_log_1k() {
-    let data = gen_log_json(1_000, 42);
-    bench("log-json 1k records", &data);
-}
-
+fn benchmark_log_1k()  { measure("log-json 1k  [random]", &gen_log_json(1_000,  42)); }
 #[test]
-fn benchmark_log_5k() {
-    let data = gen_log_json(5_000, 42);
-    bench("log-json 5k records", &data);
-}
-
+fn benchmark_log_5k()  { measure("log-json 5k  [random]", &gen_log_json(5_000,  42)); }
 #[test]
-fn benchmark_log_10k() {
-    let data = gen_log_json(10_000, 42);
-    bench("log-json 10k records", &data);
-}
+fn benchmark_log_10k() { measure("log-json 10k [random]", &gen_log_json(10_000, 42)); }
 
 #[test]
 fn benchmark_api_1k() {
-    let data = gen_api_json_periodic(1_000);
-    bench("api-json PERIODIC 1k", &data);
-    let data = gen_api_json_random(1_000, 42);
-    bench("api-json RANDOM   1k", &data);
+    measure("api-json 1k [periodic]", &gen_api_json_periodic(1_000));
+    measure("api-json 1k [random]",   &gen_api_json_random(1_000, 42));
 }
-
 #[test]
 fn benchmark_api_5k() {
-    let data = gen_api_json_periodic(5_000);
-    bench("api-json PERIODIC 5k", &data);
+    measure("api-json 5k [periodic]", &gen_api_json_periodic(5_000));
+    measure("api-json 5k [random]",   &gen_api_json_random(5_000, 42));
 }
 
 #[test]
 fn benchmark_summary() {
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets");
+
     println!();
-    println!("{:=<110}", "");
-    println!("  SCTE Compression Benchmark (stateless — no shared dictionary, no prior state)");
-    println!("{:=<110}", "");
+    println!("{:=<148}", "");
+    println!("  SCTE encoding results");
+    println!("  Build: debug (throughput in debug build — run with --release for representative numbers)");
+    println!("  All rows verified: decode(encode(input)) == input (canonical JSON comparison)");
+    println!("  zstd columns are reference data only.");
+    println!("  [periodic] = all fields cycle with small periods — columnar period detector stores base cycle only.");
+    println!("  [random]   = fields randomised independently per row via LCG.");
+    println!("{:=<148}", "");
     println!(
-        "{:<47}  {:>10}  {:>14}  {:>14}  {:>15}",
-        "Dataset / Mode", "Raw", "SCTE", "zstd -3", "zstd -19"
+        "  {:<48}  {:>11}  {:>15}  {:>13}  {:>13}  {:>15}  {:>15}",
+        "Dataset", "Raw", "SCTE", "enc MB/s", "dec MB/s", "zstd -3 ref", "zstd -19 ref"
     );
+    println!("{:-<148}", "");
+
+    // ── Real asset files ─────────────────────────────────────────────────────
+    // users_*.json structure: [{"id":N,"name":"...","friends":[{"name":"...","hobbies":[...]}]}]
+    // Nested arrays prevent columnar activation — row-major text pipeline is used.
+    println!("  [real files — assets/users_*.json  (nested JSON, row-major text pipeline)]");
+    for name in &["users_100.json", "users_1k.json", "users_10k.json"] {
+        let path = assets.join(name);
+        if path.exists() {
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+            measure(name, &data);
+        } else {
+            println!("  {name:<48}  (not found, skipped)");
+        }
+    }
+
     println!();
-    println!("  NOTE: SCTE is purely stateless — encode() takes raw bytes, no prior context.");
-    println!("  PERIODIC = data has cycling patterns (best case for SCTE period detector).");
-    println!("  RANDOM   = fields randomised independently per row (fair vs zstd comparison).");
-    println!("{:-<110}", "");
 
-    let datasets: &[(&str, Vec<u8>)] = &[
-        // --- structured log: randomised, no period ---
-        ("log-json  1k  [random]",          gen_log_json(1_000,  42)),
-        ("log-json  5k  [random]",          gen_log_json(5_000,  42)),
-        ("log-json 10k  [random]",          gen_log_json(10_000, 42)),
-        // --- api-json PERIODIC (i%4, i%100, i%28 cycling) ---
-        ("api-json  1k  [periodic i%4…]",   gen_api_json_periodic(1_000)),
-        ("api-json  5k  [periodic i%4…]",   gen_api_json_periodic(5_000)),
-        ("api-json 10k  [periodic i%4…]",   gen_api_json_periodic(10_000)),
-        // --- api-json RANDOM (independent LCG per row) ---
-        ("api-json  1k  [random]",          gen_api_json_random(1_000,  42)),
-        ("api-json  5k  [random]",          gen_api_json_random(5_000,  42)),
-        ("api-json 10k  [random]",          gen_api_json_random(10_000, 42)),
-    ];
-
-    let mut prev_group = "";
-    for (label, data) in datasets {
-        // blank line between groups
-        let group = if label.starts_with("log") { "log" } else if label.contains("periodic") { "api-p" } else { "api-r" };
-        if group != prev_group && prev_group != "" { println!(); }
-        prev_group = group;
-
-        let raw        = data.len();
-        let encoded    = encode(data).unwrap();
-        let scte_len   = encoded.len();
-
-        // Roundtrip assertion
-        let decoded   = decode(&encoded).unwrap();
-        let canon_in  = canonicalize_json(data)    .expect("canon in");
-        let canon_out = canonicalize_json(&decoded).expect("canon out");
-        assert_eq!(canon_in, canon_out, "ROUNDTRIP MISMATCH: {label}");
-
-        let zstd3_len  = zstd_compress(data, 3);
-        let zstd19_len = zstd_compress(data, 19);
-
-        let scte_pct   = scte_len   as f64 / raw as f64 * 100.0;
-        let zstd3_pct  = zstd3_len  as f64 / raw as f64 * 100.0;
-        let zstd19_pct = zstd19_len as f64 / raw as f64 * 100.0;
-        let beats      = if scte_len < zstd3_len { "✓" } else { " " };
-
-        println!(
-            "  {label:<45}  {raw:>9}B  {scte_len:>7}B {scte_pct:5.1}%  \
-             {zstd3_len:>7}B {zstd3_pct:5.1}%  \
-             {zstd19_len:>7}B {zstd19_pct:5.1}%  {beats}"
+    // ── Semi-structured (realistic service-mesh telemetry) ────────────────────
+    // Categorical fields: small vocab (service×8, env×3, dc×6, status codes×15)
+    // Value fields: sequential IDs, random latencies, random trace IDs
+    // Not purely periodic, not purely random — typical real-world API log shape.
+    println!("  [synthetic flat JSON — semi-structured: small-vocab categoricals + random value fields]");
+    for &n in &[1_000usize, 5_000, 10_000] {
+        measure(
+            &format!("api-semi  {n:>5} rows [semi]"),
+            &gen_api_json_semi(n, 42),
         );
     }
 
-    println!("{:=<110}", "");
-    println!("  ✓ = SCTE beats zstd -3  |  All rows verified: decode(encode(x)) == x");
+    println!();
+
+    // ── Synthetic flat JSON — LCG random ─────────────────────────────────────
+    println!("  [synthetic flat JSON — random fields, no cycling pattern]");
+    for &n in &[1_000usize, 5_000, 10_000] {
+        measure(
+            &format!("log-json {n:>5} rows [random]"),
+            &gen_log_json(n, 42),
+        );
+    }
+
+    println!();
+
+    // ── Synthetic flat JSON — periodic (columnar pipeline active) ─────────────
+    println!("  [synthetic flat JSON — cycling fields (i%4 / i%100 / i%28), columnar pipeline active]");
+    for &n in &[1_000usize, 5_000, 10_000] {
+        measure(
+            &format!("api-json {n:>5} rows [periodic]"),
+            &gen_api_json_periodic(n),
+        );
+    }
+
+    println!();
+
+    // ── Synthetic flat JSON — all fields independently randomised ─────────────
+    println!("  [synthetic flat JSON — all fields independently randomised per row]");
+    for &n in &[1_000usize, 5_000, 10_000] {
+        measure(
+            &format!("api-json {n:>5} rows [random]"),
+            &gen_api_json_random(n, 42),
+        );
+    }
+
+    println!("{:=<148}", "");
     println!();
 }
