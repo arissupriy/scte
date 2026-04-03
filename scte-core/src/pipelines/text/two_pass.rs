@@ -72,19 +72,31 @@ pub fn encode_json_two_pass(
     json: &[u8],
     dict_min_freq: u32,
 ) -> Result<TwoPassOutput, ScteError> {
-    // Pass 1: build schema
     let tokens = tokenize_json(json)
         .map_err(|e| ScteError::EncodeError(format!("tokenize: {e}")))?;
-    let schema = FileSchema::build(&tokens);
+    encode_json_two_pass_with_tokens(&tokens, dict_min_freq)
+}
+
+/// Encode a **pre-tokenized** JSON document using two-pass schema-aware compression.
+///
+/// Identical to [`encode_json_two_pass`] but accepts an already-parsed token
+/// stream so the caller can share a single `tokenize_json` call across both
+/// the columnar-path check and the two-pass fallback, avoiding a second parse.
+pub(crate) fn encode_json_two_pass_with_tokens(
+    tokens: &[Token],
+    dict_min_freq: u32,
+) -> Result<TwoPassOutput, ScteError> {
+    // Pass 1: build schema
+    let schema = FileSchema::build(tokens);
 
     // Pass 2: schema-encode → delta-encode → compress
-    let schema_encoded          = schema_encode_tokens(&tokens, &schema);
+    let schema_encoded               = schema_encode_tokens(tokens, &schema);
     let (delta_encoded, delta_bytes) = delta_encode_tokens(&schema_encoded, &schema);
-    let dict                    = Dictionary::build(&delta_encoded, dict_min_freq);
-    let encoded                 = encode_with_dict(&delta_encoded, &dict);
-    let token_bytes             = encode_token_bytes(&encoded)
+    let dict                         = Dictionary::build(&delta_encoded, dict_min_freq);
+    let encoded                      = encode_with_dict(&delta_encoded, &dict);
+    let token_bytes                  = encode_token_bytes(&encoded)
         .map_err(|e| ScteError::EncodeError(format!("token_bytes: {e}")))?;
-    let schema_bytes            = serializer::serialize(&schema);
+    let schema_bytes                 = serializer::serialize(&schema);
 
     Ok(TwoPassOutput { schema_bytes, token_bytes, dict, schema, delta_bytes })
 }

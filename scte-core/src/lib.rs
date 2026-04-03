@@ -66,11 +66,21 @@ pub use schema::serializer::{serialize as schema_serialize, deserialize as schem
 
 // ── Top-level convenience re-exports ────────────────────────────────────────
 
-/// Encode `input` bytes into a SCTE container.
+/// Encode `input` bytes into a SCTE container (Structured mode).
 ///
-/// Phase 1: passthrough (no compression). The container is a valid SCTE
-/// binary that `decode` can reconstruct byte-identically.
+/// JSON is transformed through the full pipeline (columnar / two-pass /
+/// entropy).  Non-JSON is stored verbatim.  For byte-exact JSON preservation
+/// use [`encode_with`] with [`EncodingMode::Raw`].
 pub use codec::encoder::encode;
+
+/// Encode with an explicit [`EncodingMode`].
+///
+/// - `EncodingMode::Structured` — full pipeline (default, best compression)
+/// - `EncodingMode::Raw`        — passthrough, always byte-exact
+pub use codec::encoder::encode_with;
+
+/// Controls whether the encoder transforms JSON or stores bytes verbatim.
+pub use codec::encoder::EncodingMode;
 
 /// Decode a SCTE container back to original bytes.
 ///

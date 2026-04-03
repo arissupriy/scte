@@ -4,36 +4,96 @@ use crate::{
         section::{SectionEntry, SECTION_ENTRY_FIXED_SIZE},
     },
     error::ScteError,
-    pipelines::text::{encode_json_two_pass, TwoPassOutput,
-                      detect_homogeneous_array, encode_columnar},
+    pipelines::text::{encode_json_two_pass_with_tokens, TwoPassOutput,
+                      try_encode_columnar_from_tokens, tokenize_json},
     types::{PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Encode `input` bytes into a SCTE container.
+/// Controls how `encode_with` treats the input.
+///
+/// # Modes
+///
+/// | Mode | JSON input | Non-JSON input | Decode guarantee |
+/// |------|-----------|----------------|-----------------|
+/// | `Structured` | full pipeline (columnar / two-pass / entropy) | passthrough | semantic equality |
+/// | `Raw` | passthrough (no transform) | passthrough | **byte-exact** |
+///
+/// Use `Raw` when you need the original bytes back verbatim — for
+/// audit logs, binary blobs embedded in JSON, or any context where you
+/// cannot afford the whitespace/key-order normalisation that the JSON
+/// pipeline applies.
+///
+/// `Structured` (the default used by `encode`) gives the best compression
+/// ratio but re-emits JSON without the original formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingMode {
+    /// Full pipeline: JSON → columnar / two-pass / entropy encoding.
+    /// Maximises compression.  Decodes to semantically identical JSON
+    /// (values preserved; whitespace and key order may differ).
+    Structured,
+
+    /// Passthrough for all inputs: bytes stored verbatim.
+    /// `decode(encode_with(x, Raw)) == x` byte-for-byte, always.
+    Raw,
+}
+
+/// Encode `input` with an explicit [`EncodingMode`].
+///
+/// ```rust
+/// use scte_core::{encode_with, EncodingMode};
+///
+/// let json = br#"{"a":1}"#;
+///
+/// // Structured: transforms JSON (best compression, semantic equality only)
+/// let structured = encode_with(json, EncodingMode::Structured).unwrap();
+///
+/// // Raw: no transform — decode gives back the exact original bytes
+/// let raw = encode_with(json, EncodingMode::Raw).unwrap();
+/// let decoded = scte_core::decode(&raw).unwrap();
+/// assert_eq!(decoded, json);
+/// ```
+pub fn encode_with(input: &[u8], mode: EncodingMode) -> Result<Vec<u8>, ScteError> {
+    if input.len() > MAX_DECOMPRESSED_SIZE {
+        return Err(ScteError::InputTooLarge(input.len()));
+    }
+    match mode {
+        EncodingMode::Raw => encode_passthrough(input),
+        EncodingMode::Structured => encode_structured(input),
+    }
+}
+
+/// Encode `input` bytes into a SCTE container using [`EncodingMode::Structured`].
 ///
 /// # Dispatch
-/// - **JSON input** (`{…}` or `[…]`): full Phase 2-7 pipeline —
-///   schema inference, dictionary, rANS/CTW, delta encoding.
-///   Produces a multi-section container: SCHEMA + DICT + TOKENS (+ DELTA if
-///   any integer columns were detected).
-/// - **All other input**: Phase 1 passthrough — wraps bytes verbatim in a
-///   single DATA section for binary-identical reconstruction.
+/// - **JSON input** (`{…}` or `[…]`): full Phase 2-7 pipeline.
+/// - **All other input**: passthrough — bytes stored verbatim.
+///
+/// For byte-exact reconstruction of JSON use [`encode_with`] with
+/// [`EncodingMode::Raw`].
 ///
 /// # Errors
 /// - `InputTooLarge` — input exceeds `MAX_DECOMPRESSED_SIZE` (4 GiB)
-/// - `EncodeError`   — JSON pipeline error (malformed JSON, etc.)
 pub fn encode(input: &[u8]) -> Result<Vec<u8>, ScteError> {
     if input.len() > MAX_DECOMPRESSED_SIZE {
         return Err(ScteError::InputTooLarge(input.len()));
     }
+    encode_structured(input)
+}
 
+fn encode_structured(input: &[u8]) -> Result<Vec<u8>, ScteError> {
     if looks_like_json(input) {
-        encode_json(input)
-    } else {
-        encode_passthrough(input)
+        // `looks_like_json` is a heuristic (first byte is `{` or `[`).
+        // If the content turns out to be invalid JSON (e.g. a log file that
+        // starts with `[timestamp]`), fall back silently to passthrough so
+        // that all inputs are always accepted and decoded byte-exactly.
+        match encode_json(input) {
+            Ok(v) => return Ok(v),
+            Err(_) => { /* not actually JSON — fall through to passthrough */ }
+        }
     }
+    encode_passthrough(input)
 }
 
 // ── JSON path ─────────────────────────────────────────────────────────────────
@@ -45,14 +105,20 @@ fn looks_like_json(input: &[u8]) -> bool {
 }
 
 fn encode_json(input: &[u8]) -> Result<Vec<u8>, ScteError> {
+    // Tokenize once.  Both the columnar-path check and the two-pass fallback
+    // consume the same token stream, eliminating the double (or triple) parse
+    // that the old detect_homogeneous_array + encode_columnar / encode_json_two_pass
+    // pattern incurred on every call.
+    let tokens = tokenize_json(input)
+        .map_err(|e| ScteError::EncodeError(format!("tokenize: {e}")))?;
+
     // Try columnar path first (Array<Object> with uniform schema).
-    if detect_homogeneous_array(input) {
-        if let Ok(columnar_bytes) = encode_columnar(input) {
-            return assemble_columnar_container(input.len(), &columnar_bytes);
-        }
+    if let Some(columnar_bytes) = try_encode_columnar_from_tokens(&tokens) {
+        return assemble_columnar_container(input.len(), &columnar_bytes);
     }
-    // Fall back to row-major two-pass pipeline.
-    let out = encode_json_two_pass(input, 2)?;
+
+    // Fall back to row-major two-pass pipeline using the pre-parsed tokens.
+    let out = encode_json_two_pass_with_tokens(&tokens, 2)?;
     assemble_text_container(input.len(), &out)
 }
 
