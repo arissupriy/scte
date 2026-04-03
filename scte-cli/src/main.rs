@@ -1,8 +1,12 @@
 use std::{env, fs, process};
 
 use scte_core::{
-    container::header::{ScteHeader, HEADER_SIZE},
+    container::{
+        header::{ScteHeader, HEADER_SIZE},
+        section::{SectionEntry, SECTION_ENTRY_FIXED_SIZE},
+    },
     decode, encode,
+    types::{SectionCodec, SectionType},
 };
 
 fn main() {
@@ -90,14 +94,67 @@ fn cmd_inspect(args: &[String]) {
         process::exit(1);
     });
 
-    println!("── SCTE Container ──────────────────────────────");
+    println!("── SCTE Container ──────────────────────────────────────────");
+    println!("  file_size      : {} bytes", input.len());
     println!("  format version : 0x{:02x}", header.version);
     println!("  flags          : 0x{:02x}", header.flags);
     println!("  pipeline_id    : 0x{:02x}  ({:?})", header.pipeline_id as u8, header.pipeline_id);
     println!("  original_size  : {} bytes", header.original_size);
     println!("  section_count  : {}", header.section_count);
-    println!("  file_size      : {} bytes", input.len());
-    println!("────────────────────────────────────────────────");
+    println!("────────────────────────────────────────────────────────────");
+
+    // Parse and display section table
+    let mut cursor = HEADER_SIZE;
+    for idx in 0..header.section_count as usize {
+        let remaining = match input.get(cursor..) {
+            Some(s) if s.len() >= SECTION_ENTRY_FIXED_SIZE => s,
+            _ => {
+                eprintln!("  error: section table truncated at entry {idx}");
+                break;
+            }
+        };
+
+        match SectionEntry::read(remaining) {
+            Ok((entry, consumed)) => {
+                let type_name = match entry.section_type {
+                    SectionType::Dict     => "Dict     ",
+                    SectionType::Tokens   => "Tokens   ",
+                    SectionType::Delta    => "Delta    ",
+                    SectionType::Chunks   => "Chunks   ",
+                    SectionType::Index    => "Index    ",
+                    SectionType::Data     => "Data     ",
+                    SectionType::Meta     => "Meta     ",
+                    SectionType::Schema   => "Schema   ",
+                    SectionType::Columnar => "Columnar ",
+                };
+                let codec_name = match entry.codec {
+                    SectionCodec::None       => "None      ",
+                    SectionCodec::Rans       => "rANS      ",
+                    SectionCodec::Zstd       => "Zstd      ",
+                    SectionCodec::Varint     => "Varint    ",
+                    SectionCodec::Arithmetic => "Arithmetic",
+                };
+                // Verify payload checksum
+                let start = entry.offset as usize;
+                let end   = start.saturating_add(entry.length as usize);
+                let status = if let Some(payload) = input.get(start..end) {
+                    if entry.verify_payload(payload, idx).is_ok() { "✓" } else { "✗ bad checksum" }
+                } else {
+                    "✗ out of bounds"
+                };
+                println!(
+                    "  [{idx}] type={type_name}  codec={codec_name}  offset={:>8}  length={:>8}  checksum=0x{:08x}  {status}",
+                    entry.offset, entry.length, entry.checksum
+                );
+                cursor += consumed;
+            }
+            Err(e) => {
+                eprintln!("  error: cannot parse section entry {idx}: {e}");
+                break;
+            }
+        }
+    }
+    println!("────────────────────────────────────────────────────────────");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
