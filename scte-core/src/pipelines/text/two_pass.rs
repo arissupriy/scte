@@ -495,7 +495,16 @@ fn deserialize_delta_paths(data: &[u8]) -> Vec<String> {
 /// Produces compact JSON (no whitespace). Object keys are emitted in
 /// declaration order, matching the original document order.
 pub fn tokens_to_json(tokens: &[Token]) -> Vec<u8> {
-    let mut out   = Vec::new();
+    // Estimate output capacity: strings contribute their length + 2 quotes;
+    // numbers/bools ~8 bytes each; brackets/colons/commas already counted small.
+    let est: usize = tokens.iter().map(|t| match &t.payload {
+        TokenPayload::Str(s) => s.len() + 3,
+        TokenPayload::Int(_) => 12,
+        TokenPayload::Float(_) => 16,
+        TokenPayload::Bool(_)  => 6,
+        TokenPayload::None     => 2,
+    }).sum();
+    let mut out   = Vec::with_capacity(est);
     // Stack: (is_object, items_written_so_far)
     let mut stack: Vec<(bool, usize)> = Vec::new();
 

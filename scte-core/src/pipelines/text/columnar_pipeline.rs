@@ -902,111 +902,157 @@ fn decode_variant_table(data: &[u8], pos: &mut usize) -> Result<Vec<String>, Sct
 
 // ── JSON reconstruction ───────────────────────────────────────────────────────
 
+/// Per-column path metadata pre-computed once for all rows.
+///
+/// Eliminates per-row allocations of `split`, `join`, and `format!`
+/// that the old `emit_row_json` performed for every column × every row.
+struct ColMeta {
+    /// Nesting depth of the parent (0 = top-level field).
+    depth: usize,
+    /// Full parent-path string at each nesting level (used for scope matching).
+    /// `scope_paths[i]` = segments[0..=i].join(".")
+    scope_paths: Vec<String>,
+    /// Pre-built bytes to emit when *opening* scope level i: `"seg":{`
+    scope_open: Vec<Vec<u8>>,
+    /// Pre-built bytes for the leaf key emission: `"leaf":`
+    key_prefix: Vec<u8>,
+}
+
+fn build_col_meta(cols: &[(String, Vec<String>)]) -> Vec<ColMeta> {
+    cols.iter().map(|(path, _)| {
+        let parts: Vec<&str> = path.split('.').collect();
+        let leaf         = *parts.last().unwrap();
+        let parent_parts = &parts[..parts.len() - 1];
+        let depth        = parent_parts.len();
+
+        // scope_paths[i] = first i+1 parent segments joined
+        let scope_paths: Vec<String> = (0..depth)
+            .map(|i| parent_parts[..=i].join("."))
+            .collect();
+
+        // scope_open[i] = pre-escaped bytes: "seg":{
+        let scope_open: Vec<Vec<u8>> = parent_parts.iter().map(|seg| {
+            let mut b = Vec::with_capacity(seg.len() + 4);
+            b.push(b'"');
+            json_escape_bytes_into(seg.as_bytes(), &mut b);
+            b.extend_from_slice(b"\":{");
+            b
+        }).collect();
+
+        // key_prefix = "leaf":
+        let mut key_prefix = Vec::with_capacity(leaf.len() + 3);
+        key_prefix.push(b'"');
+        json_escape_bytes_into(leaf.as_bytes(), &mut key_prefix);
+        key_prefix.extend_from_slice(b"\":");
+
+        ColMeta { depth, scope_paths, scope_open, key_prefix }
+    }).collect()
+}
+
 /// Turn decoded columns back into a JSON array of objects.
 fn reconstruct_json(cols: &[(String, Vec<String>)], row_count: usize) -> Vec<u8> {
-    let mut out = Vec::new();
+    let meta = build_col_meta(cols);
+
+    // Estimate output size: sum all value lengths + per-col key overhead × rows.
+    let total_val: usize = cols.iter()
+        .map(|(path, vals)| {
+            let vlen: usize = vals.iter().map(|v| v.len()).sum();
+            vlen + (path.len() + 5) * row_count   // key overhead per row
+        })
+        .sum();
+    let capacity = total_val + row_count * 2 + 2;
+
+    let mut out = Vec::with_capacity(capacity);
     out.push(b'[');
     for row in 0..row_count {
         if row > 0 { out.push(b','); }
-        emit_row_json(cols, row, &mut out);
+        emit_row_json_meta(&meta, cols, row, &mut out);
     }
     out.push(b']');
     out
 }
 
-/// Emit one row as a JSON object, handling nested dot-paths.
-fn emit_row_json(cols: &[(String, Vec<String>)], row: usize, out: &mut Vec<u8>) {
-    // Scope stack: each entry is (path_prefix, emitted_any_in_scope)
-    let mut scope_stack: Vec<(String, bool)> = Vec::new();
+/// Emit one row as a JSON object using pre-computed `ColMeta`.
+/// No allocations happen inside here — all string metadata is pre-built.
+fn emit_row_json_meta(
+    meta: &[ColMeta],
+    cols: &[(String, Vec<String>)],
+    row:  usize,
+    out:  &mut Vec<u8>,
+) {
+    // Scope stack: (borrowed scope_path str, emitted_any_in_scope)
+    let mut scope_stack: Vec<(&str, bool)> = Vec::with_capacity(4);
     let mut top_emitted = false;
 
     out.push(b'{');
 
-    for (path, values) in cols {
-        let parts: Vec<&str> = path.split('.').collect();
-        let leaf = parts.last().unwrap();
-        let parent_parts = &parts[..parts.len() - 1];
-        let parent_path = parent_parts.join(".");
+    for (m, (_, values)) in meta.iter().zip(cols.iter()) {
+        let parent_path: &str = if m.depth == 0 {
+            ""
+        } else {
+            &m.scope_paths[m.depth - 1]
+        };
 
-        // Pop scopes that no longer match the current parent path
-        while !scope_stack.is_empty() {
-            let cur_scope = &scope_stack.last().unwrap().0;
-            // Check if current scope is a prefix of the target parent path
-            let still_valid = if parent_path.is_empty() {
-                false
-            } else if cur_scope.is_empty() {
-                true
-            } else {
-                parent_path == *cur_scope
-                    || parent_path.starts_with(&format!("{cur_scope}."))
-            };
-            if still_valid {
-                break;
+        // Pop scopes that no longer encompass this column's parent path.
+        loop {
+            match scope_stack.last() {
+                None => break,
+                Some(&(cur_scope, _)) => {
+                    let still_valid = if parent_path.is_empty() {
+                        false
+                    } else if cur_scope.is_empty() {
+                        true
+                    } else {
+                        parent_path == cur_scope
+                            || (parent_path.len() > cur_scope.len()
+                                && parent_path.as_bytes()[cur_scope.len()] == b'.'
+                                && parent_path.starts_with(cur_scope))
+                    };
+                    if still_valid { break; }
+                    out.push(b'}');
+                    scope_stack.pop();
+                }
             }
-            out.push(b'}');
-            scope_stack.pop();
         }
 
-        // Open new scopes as needed
-        while scope_stack.len() < parent_parts.len() {
-            let seg = parent_parts[scope_stack.len()];
-
-            // Need comma before opening this new nested key?
+        // Open new scopes until we reach the required nesting depth.
+        while scope_stack.len() < m.depth {
+            let level = scope_stack.len();
             let need_comma = if scope_stack.is_empty() {
                 top_emitted
             } else {
-                scope_stack.last().map(|s| s.1).unwrap_or(false)
+                scope_stack.last().unwrap().1
             };
             if need_comma { out.push(b','); }
-
-            // Mark current scope as having emitted something
             if scope_stack.is_empty() {
                 top_emitted = true;
             } else if let Some(s) = scope_stack.last_mut() {
                 s.1 = true;
             }
-
-            // Build the scope path
-            let scope_path = if scope_stack.is_empty() {
-                seg.to_owned()
-            } else {
-                format!("{}.{}", scope_stack.last().unwrap().0, seg)
-            };
-
-            // Emit: "seg":{
-            out.push(b'"');
-            json_escape_bytes_into(seg.as_bytes(), out);
-            out.extend_from_slice(b"\":{");
-            scope_stack.push((scope_path, false));
+            out.extend_from_slice(&m.scope_open[level]);
+            scope_stack.push((&m.scope_paths[level], false));
         }
 
-        // Emit the leaf value
+        // Emit the leaf: "key":value
         let need_comma = if scope_stack.is_empty() {
             top_emitted
         } else {
-            scope_stack.last().map(|s| s.1).unwrap_or(false)
+            scope_stack.last().unwrap().1
         };
         if need_comma { out.push(b','); }
-
-        // Mark emitted
         if scope_stack.is_empty() {
             top_emitted = true;
         } else if let Some(s) = scope_stack.last_mut() {
             s.1 = true;
         }
-
-        // "key":value
-        out.push(b'"');
-        json_escape_bytes_into(leaf.as_bytes(), out);
-        out.extend_from_slice(b"\":");
+        out.extend_from_slice(&m.key_prefix);
         out.extend_from_slice(values[row].as_bytes());
     }
 
-    // Close remaining scopes
-    while scope_stack.pop().is_some() {
+    // Close remaining open scopes.
+    for _ in scope_stack.drain(..) {
         out.push(b'}');
     }
-
     out.push(b'}');
 }
 

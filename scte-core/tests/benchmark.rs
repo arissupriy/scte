@@ -211,7 +211,9 @@ fn measure(label: &str, data: &[u8]) {
         || { let _ = decode(&encoded).unwrap(); },
         300,
     );
-    let dec_mbs = enc_len as f64 * dec_n as f64 / dec_secs / 1_048_576.0;
+    // Decode throughput: measured as reconstructed (output) bytes/sec.
+    // For asymmetric codecs the output size is the meaningful work unit.
+    let dec_mbs = raw as f64 * dec_n as f64 / dec_secs / 1_048_576.0;
 
     let z3  = zstd_len(data, 3);
     let z19 = zstd_len(data, 19);
