@@ -1,46 +1,194 @@
 # SCTE — Semantic Compression & Transport Engine
 
-A next-generation compression and transport engine that integrates
-structure-aware encoding, adaptive pipelines, and entropy coding to
-outperform traditional byte-level compression algorithms in real-world
-data transfer scenarios.
+Structure-aware encoding engine for semi-structured data (JSON, logs, tabular payloads), written in Rust.
 
 ---
 
-## Overview
+## What It Does
 
-SCTE is a **Rust-based, production-grade encoding engine** designed around one core insight:
+SCTE encodes JSON by exploiting its structure rather than treating it as an opaque byte stream:
 
-> Most data transferred today is not random bytes — it has structure.
-> Exploiting that structure before entropy coding yields far better results
-> than treating data as an opaque byte stream.
+- **Columnar layout** — for `Array<Object>` inputs, values from the same field across all rows are grouped together before encoding
+- **Schema inference** — integer, enum, timestamp, UUID, base64, and prefix-pattern fields each get a type-specific encoder
+- **Entropy coding** — per-column rANS on top of delta/enum residuals
+- **Period detection** — cycling sequences stored as a single base cycle
+- **Passthrough** — non-JSON inputs (binary, XML, CSV, logs) are stored verbatim, byte-exact
 
-Instead of a single compression algorithm, SCTE routes data through a
-**type-aware pipeline** — JSON takes a different path than a binary executable,
-which takes a different path than a log file — and applies the most effective
-combination of transformations per data class.
+---
+
+## Measured Results
+
+All figures from `cargo test --release --test benchmark`. `decode(encode(x)) == x` verified for every row. zstd numbers are reference, same machine.
+
+```
+Dataset                                    Raw         SCTE    enc MB/s   dec MB/s   zstd-3    zstd-19
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+Real files — nested JSON (row-major text pipeline)
+  users_100.json                         29929B    3070B  10.3%   24.8 MB/s   77.0 MB/s   16.6%   13.2%
+  users_1k.json                         311042B   18074B   5.8%   25.8 MB/s   85.3 MB/s   14.7%    9.4%
+  users_10k.json                       3084967B  162863B   5.3%   19.5 MB/s   65.0 MB/s   14.4%    8.1%
+
+Real files — flat JSON (columnar pipeline)
+  flat_users_1k.json                     54171B    3126B   5.8%   14.7 MB/s   84.8 MB/s   16.7%   12.8%
+  flat_users_10k.json                   551951B   22714B   4.1%   15.1 MB/s   85.5 MB/s   15.9%   10.1%
+  flat_users_100k.json                 5619926B  218597B   3.9%   15.0 MB/s   81.9 MB/s   15.6%    9.8%
+
+Entropy ceiling — UUID keys + base64 payloads + random latencies
+  uuid-b64   1000 rows                  109060B   30282B  27.8%   25.9 MB/s   79.2 MB/s   37.9%   36.5%
+  uuid-b64  10000 rows                 1090984B  298567B  27.4%   30.1 MB/s   83.0 MB/s   38.2%   35.9%
+
+Semi-structured — small-vocab categoricals + random value fields
+  api-semi   1000 rows                  148561B   12131B   8.2%   26.7 MB/s  125.1 MB/s   18.2%   13.4%
+  api-semi   5000 rows                  746507B   57482B   7.7%   22.4 MB/s   97.2 MB/s   18.3%   12.9%
+  api-semi  10000 rows                 1494038B  114214B   7.6%   28.2 MB/s  133.3 MB/s   18.3%   12.7%
+
+Random flat JSON — no cycling pattern
+  log-json  1000 rows                    99855B    5060B   5.1%   29.7 MB/s  154.5 MB/s   11.4%    7.1%
+  log-json  5000 rows                   503481B   16322B   3.2%   18.9 MB/s  117.8 MB/s   11.3%    6.9%
+  log-json 10000 rows                  1008244B   30380B   3.0%   25.0 MB/s  166.6 MB/s   11.3%    6.8%
+
+Cycling fields — columnar pipeline, period detector active
+  api-json  1000 rows [periodic]        145641B     862B   0.6%   28.9 MB/s  158.3 MB/s    2.8%    2.2%
+  api-json  5000 rows [periodic]        732641B     862B   0.1%   18.5 MB/s  130.0 MB/s    1.9%    1.5%
+  api-json 10000 rows [periodic]       1466391B     862B   0.1%   17.1 MB/s  131.2 MB/s    1.7%    1.4%
+
+All fields independently random per row
+  api-json  1000 rows [random]          146468B    4491B   3.1%   32.8 MB/s  187.2 MB/s    9.8%    7.3%
+  api-json  5000 rows [random]          737129B   18628B   2.5%   31.0 MB/s  185.1 MB/s    9.6%    7.1%
+  api-json 10000 rows [random]         1475245B   36249B   2.5%   30.3 MB/s  180.5 MB/s    9.6%    7.0%
+```
+
+Non-JSON passthrough (byte-exact):
+
+```
+  HPC_2k.log           149178B → 149226B  byte-exact=YES
+  OpenStack_2k.log     593120B → 593168B  byte-exact=YES
+  Proxifier_2k.log     236962B → 237010B  byte-exact=YES
+  CSV (2.2 MB)        2272701B → 2272749B  byte-exact=YES
+  book5.3.0.xml          7734B →   7782B  byte-exact=YES
+  15mb.xml           15400141B → 15400189B  byte-exact=YES
+```
+
+The ~48 byte overhead on non-JSON inputs is the SCTE container header and section table.
+
+---
+
+## Encoding Modes
+
+```rust
+use scte_core::{encode, encode_with, EncodingMode, decode};
+
+// Structured: full pipeline — best compression, semantic equality
+// values preserved; whitespace and key order may differ from input
+let encoded = encode(json_bytes)?;
+
+// Raw: passthrough for all inputs — byte-exact always
+let encoded = encode_with(input, EncodingMode::Raw)?;
+assert_eq!(decode(&encoded)?, input);
+```
+
+| Mode | JSON | Non-JSON | Guarantee |
+|---|---|---|---|
+| `Structured` | full pipeline | passthrough | values preserved; whitespace/key-order may change |
+| `Raw` | passthrough | passthrough | byte-exact |
 
 ---
 
 ## Architecture
 
 ```
-Input → Detect → Classify → Route → Encode → SCTE Container
-                                │
-                                ├─ Text Pipeline     (JSON, CSV, XML, log)
-                                ├─ Binary Pipeline   (executables, firmware)
-                                ├─ Container Pipeline(DOCX, XLSX)
-                                └─ Passthrough       (encrypted / random)
+encode(input)
+  ├─ looks_like_json? (first non-whitespace byte is { or [)
+  │    ├─ tokenize_json()  ← one parse, shared by both downstream paths
+  │    ├─ homogeneous Array<Object>?
+  │    │    └─ columnar pipeline  →  COLUMNAR section (0x09)
+  │    └─ otherwise
+  │         └─ two-pass text pipeline  →  SCHEMA + DICT + TOKENS + DELTA sections
+  └─ not JSON  (or JSON parse fails)
+       └─ passthrough  →  PAYLOAD section, byte-exact
 ```
 
-The engine is split into a **single core library** deployed in two roles:
+### Columnar Pipeline
 
-| Role   | Responsibility                                   |
-|--------|--------------------------------------------------|
-| Client | Detect → transform → encode → send              |
-| Server | Receive → decode → reconstruct → store          |
+Activated for `Array<Object>` with a uniform key schema and ≥2 rows.
 
-One codebase. No algorithm drift between sides.
+Each column gets an independent encoder selected by size comparison:
+
+| Tag | Strategy |
+|---|---|
+| `TAG_INT_PERIOD` | period repeat |
+| `TAG_INT_RANS` | rANS on delta residuals (≥64 rows) |
+| `TAG_INT` | delta zigzag-varint |
+| `TAG_ENUM_PERIOD` | period repeat on variant indices |
+| `TAG_ENUM_RANS` | rANS on variant indices (≥64 rows) |
+| `TAG_ENUM_RLE` | run-length on variant indices |
+| `TAG_ENUM` | delta-encoded variant index (≤256 distinct strings) |
+| `TAG_STRPREFIX` | common prefix + delta integer suffix |
+| `TAG_STRPREFIX_HEX` | common prefix + binary-packed hex suffix |
+| `TAG_UUID` | 36-char UUID → 16 raw bytes |
+| `TAG_BASE64` | base64 → raw bytes |
+| `TAG_TIMESTAMP` | delta epoch-seconds |
+| `TAG_FLOAT_FIXED` | scale × 10^d as delta integer |
+| `TAG_BACKREF` | copy of earlier identical column |
+| `TAG_BOOL` | bit-packed |
+| `TAG_NULL` | empty |
+| `TAG_SUB_TABLE` | recursive columnar block for array-valued fields |
+| `TAG_RAW_STR` | verbatim per-row strings |
+
+### Two-Pass Text Pipeline
+
+For JSON that is not a homogeneous array:
+
+```
+Pass 1 — tokenize_json() → FileSchema::build()
+         infers per-field type: Enum, StrPrefix, FloatFixed, Timestamp,
+         Integer{Sequential|Monotonic|Clustered|Bounded|Flat}
+
+Pass 2 — schema_encode_tokens()   (Str → NumInt for enum/prefix/timestamp)
+       → delta_encode_tokens()    (integer columns → delta residuals)
+       → Dictionary::build()      (high-frequency tokens → compact IDs)
+       → encode_with_dict()
+       → encode_token_bytes()     (rANS on token stream)
+```
+
+### Integer Delta Patterns
+
+Five patterns for integer columns, applied in priority order:
+
+| Pattern | Condition | Wire cost |
+|---|---|---|
+| `Sequential` | all deltas equal | first + step + count (3 varints) |
+| `Clustered` | max\|delta\| ≤ 8 | first + N×1–2 byte deltas |
+| `Monotonic` | all deltas ≥0 and <1024 | first + N×1–2 byte deltas |
+| `Bounded` | max\|delta\| < value\_range/2 | first + N small signed deltas |
+| `Flat` | none above | N full-width zigzag varints |
+
+`Bounded` handles fields like Unix-ms timestamps (`1743724800123`) where the value spans a large range but changes by <2000 per row. Without it, each value stored 6+ bytes; with it, only the first value is full-width.
+
+---
+
+## Wire Format
+
+Container header (24 bytes):
+```
+[0..3]  magic      "SCTE"
+[4..5]  version    u16
+[6..7]  pipeline   u16   (0x01 = Text)
+[8..11] flags      u32
+[12..19] orig_len  u64   (original unencoded length)
+[20..21] sec_count u16
+[22..23] pad
+```
+
+Section entry (20 bytes each):
+```
+[0]     type    u8    (0x01=DICT, 0x02=TOKENS, 0x07=PAYLOAD,
+                        0x08=SCHEMA, 0x09=COLUMNAR, 0x0A=DELTA, …)
+[1]     codec   u8    (0x00=None, 0x01=Zstd)
+[2..3]  pad
+[4..11] offset  u64
+[12..19] length u64
+```
 
 ---
 
@@ -48,109 +196,63 @@ One codebase. No algorithm drift between sides.
 
 ```
 scte/
-├── scte-core/      Pure Rust engine — no I/O, no network, no platform deps
-├── scte-cli/       Command-line interface (encode / decode / inspect)
-├── scte-ffi/       C ABI layer for mobile and cross-language bindings  (Phase 7)
-└── bindings/
-    ├── dart/       Flutter + Dart CLI via dart:ffi                     (Phase 7)
-    ├── wasm/       Browser / Node.js via wasm-pack                     (Phase 8)
-    ├── node/       Node.js native via napi-rs                          (Phase 4)
-    └── python/     Python via cffi                                     (Phase 4)
+├── scte-core/     Pure Rust engine — no I/O, no network deps
+│   ├── src/
+│   │   ├── codec/           encode() / decode() entry points, EncodingMode
+│   │   ├── container/       header and section wire format
+│   │   ├── entropy/         rANS codec (FreqTable, rans_encode, rans_decode)
+│   │   ├── pipelines/
+│   │   │   └── text/
+│   │   │       ├── columnar_pipeline.rs   Array<Object> encoder/decoder
+│   │   │       ├── two_pass.rs            row-major schema-aware pipeline
+│   │   │       ├── tokenizer.rs           JSON → token stream
+│   │   │       ├── value.rs               JSON parser + internal IR
+│   │   │       ├── canonicalize.rs        deterministic JSON serializer
+│   │   │       ├── delta/
+│   │   │       │   ├── integer.rs         Sequential/Clustered/Monotonic/Bounded/Flat
+│   │   │       │   └── timestamp.rs       ISO 8601 ↔ epoch seconds
+│   │   │       ├── dictionary/            token frequency dictionary
+│   │   │       └── pattern/               prefix pattern detection
+│   │   └── schema/          field type inference (Enum/StrPrefix/FloatFixed/Timestamp)
+│   └── tests/
+│       └── benchmark.rs     correctness + throughput tests (real asset files)
+├── scte-cli/      Command-line encode/decode/inspect
+└── assets/        JSON files used by benchmark tests
 ```
-
----
-
-## CLI Usage
-
-```bash
-# Encode a file into a SCTE container
-scte encode input.json output.scte
-
-# Decode back to original
-scte decode output.scte restored.json
-
-# Inspect container metadata
-scte inspect output.scte
-```
-
----
-
-## Development Phases
-
-| Phase | Feature                        | Status        |
-|-------|--------------------------------|---------------|
-| 1     | Minimal core — container format| ✅ Complete    |
-| 2     | Text pipeline — JSON           | ✅ Complete    |
-| 3     | Dictionary encoding            | ✅ Complete    |
-| 4     | Entropy coding (rANS)          | 🔄 Next       |
-| 5     | Pipeline integration           | ⏳ Planned    |
-| 6     | Memory & zero-copy optimization| ⏳ Planned    |
-| 7     | C ABI / FFI layer              | ⏳ Planned    |
-| 8     | WASM binding                   | ⏳ Planned    |
-
-## Text Pipeline (Phase 2 & 3)
-
-The text pipeline processes JSON through four stages:
-
-```
-JSON bytes
-  → canonicalize_json()    — deterministic form, sorted keys, no whitespace
-  → tokenize_json()        — flat token stream (ObjOpen/Key/Str/NumInt/…)
-  → Dictionary::build()    — frequency analysis, token → u16 ID mapping
-  → encode_with_dict()     — high-frequency strings replaced by compact IDs
-```
-
-Stage output is stored in two SCTE sections:
-- `DICT (0x01)` — serialized dictionary (LEB128 wire format)
-- `TOKENS (0x02)` — dictionary-encoded token stream (Phase 4: rANS-coded)
-
-### Token kinds
-
-| Kind       | Description                              |
-|------------|------------------------------------------|
-| `ObjOpen`  | `{`                                      |
-| `ObjClose` | `}`                                      |
-| `ArrOpen`  | `[`                                      |
-| `ArrClose` | `]`                                      |
-| `Key`      | Object key string (dict-eligible)        |
-| `Str`      | String value (dict-eligible)             |
-| `NumInt`   | Integer-normalised number (i64)          |
-| `NumFloat` | Genuine floating-point (f64)             |
-| `Bool`     | `true` / `false`                         |
-| `Null`     | `null`                                   |
-
-### Dictionary properties
-- Max capacity: **65 535 entries** (u16 ID space)
-- Sort order: frequency descending; ties broken by `(kind, value)` byte order
-- `Key` and `Str` with the same string value get **separate** dictionary entries
-- Wire format: `varint(K)` + per entry: `type(1) + varint(len) + utf8_bytes`
-
----
-
-
-
-- **Lossless** — `decode(encode(x)) == x`, always, byte-identical
-- **Deterministic** — identical input + config = identical output across platforms
-- **Zero external dependencies** in `scte-core` (Phases 1–3)
-- **Language-agnostic** — C ABI as the stable system boundary
-- **Mobile-ready** — designed for Dart FFI (Flutter) and WASM from the ground up
 
 ---
 
 ## Building
 
 ```bash
-# Run all tests
-cargo test
-
-# Build release binary
+# Build
 cargo build --release
 
-# Binary location
-./target/release/scte-cli
+# Run unit tests (345 tests)
+cargo test --release --lib
+
+# Run integration + benchmark tests (~45 s)
+cargo test --release --test benchmark -- --nocapture
+
+# Run only correctness tests
+cargo test --release --test benchmark verify
+
+# CLI
+./target/release/scte-cli encode input.json output.scte
+./target/release/scte-cli decode output.scte restored.json
+./target/release/scte-cli inspect output.scte
 ```
 
 Requires: **Rust 1.70+** (stable)
+
+---
+
+## Correctness
+
+- `decode(encode(x))` verified for every dataset in `tests/benchmark.rs`
+- JSON inputs: canonical comparison (all values identical; whitespace and key order normalized)
+- Non-JSON inputs: byte-exact (`decode(encode(x)) == x`)
+- 345 unit tests, 12 integration tests
 
 ---
 
