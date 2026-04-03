@@ -95,6 +95,20 @@ const TAG_BOOL: u8 = 0x0C;
 /// Header: none.  Body: none.
 const TAG_NULL: u8 = 0x0D;
 
+/// String column with a constant prefix and binary-packed hex suffix.
+/// Handles fields like `"scte-a1b2c3d4e5f6"` or `"uuid-deadbeef..."`.
+/// The hex suffix (even number of hex digits) is encoded as raw bytes (2 chars → 1 byte).
+///
+/// Wire layout:
+///   TAG_STRPREFIX_HEX  u8
+///   prefix_len         varint
+///   prefix_bytes       prefix_len bytes
+///   hex_byte_len       varint  (number of packed bytes per row; hex chars = hex_byte_len × 2)
+///   row_0_packed       hex_byte_len bytes
+///   row_1_packed       hex_byte_len bytes
+///   …
+const TAG_STRPREFIX_HEX: u8 = 0x0E;
+
 const COLUMNAR_VERSION: u8 = 1;
 
 /// Maximum period length to search (caps brute-force O(n·P) scan).
@@ -512,6 +526,24 @@ fn encode_by_type(col: &RawColumn, _row_count: usize, out: &mut Vec<u8>) {
             }
         }
 
+        // Try HexSuffix — constant prefix + hex-encoded binary suffix (e.g. trace IDs, UUIDs)
+        if let Some((prefix, hex_byte_len)) = detect_hex_suffix(&strs) {
+            out.push(TAG_STRPREFIX_HEX);
+            varint::encode_usize(prefix.len(), out);
+            out.extend_from_slice(prefix.as_bytes());
+            varint::encode_usize(hex_byte_len, out);
+            let hex_start = prefix.len();
+            for s in &strs {
+                let hex_chars = s[hex_start..].as_bytes();
+                for i in 0..hex_byte_len {
+                    let hi = hex_nibble(hex_chars[i * 2]);
+                    let lo = hex_nibble(hex_chars[i * 2 + 1]);
+                    out.push((hi << 4) | lo);
+                }
+            }
+            return;
+        }
+
         // Try Enum (≤ 256 distinct values)
         encode_enum_column(&strs, out);
         return;
@@ -638,6 +670,42 @@ fn detect_strprefix(strs: &[&str]) -> Option<(String, u8, Vec<i64>)> {
     if suffixes.len() < strs.len() * 80 / 100 { return None; }
 
     Some((prefix.to_owned(), suffix_width, suffixes))
+}
+
+/// Detect a column where every value is `<fixed_prefix><hex_suffix>` with:
+/// - the same prefix for all rows,
+/// - all suffixes valid hex digits of identical even length.
+///
+/// Returns `(prefix, hex_byte_len)` where hex_byte_len = suffix_len / 2.
+fn detect_hex_suffix(strs: &[&str]) -> Option<(String, usize)> {
+    if strs.len() < 2 { return None; }
+    let first = strs[0];
+    // Common prefix length across all strings
+    let prefix_len = strs[1..].iter().fold(first.len(), |min_len, s| {
+        let common = first.bytes().zip(s.bytes()).take_while(|(a, b)| a == b).count();
+        min_len.min(common)
+    });
+    // Suffix of the first string after the common prefix
+    let suffix_len = first.len().checked_sub(prefix_len)?;
+    // Suffix must be non-empty and have an even number of hex digits
+    if suffix_len == 0 || suffix_len % 2 != 0 { return None; }
+    let hex_byte_len = suffix_len / 2;
+    // Every row's suffix must be the same length and all hex
+    for s in strs {
+        if s.len() != first.len() { return None; }
+        if !s[prefix_len..].bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+    }
+    Some((first[..prefix_len].to_owned(), hex_byte_len))
+}
+
+#[inline(always)]
+fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _           => 0,
+    }
 }
 
 // ── Bit packing ───────────────────────────────────────────────────────────────
@@ -856,6 +924,27 @@ fn decode_one_column(
                 let s = std::str::from_utf8(sbytes)
                     .map_err(|_| ScteError::DecodeError("columnar: TAG_RAW_STR bad utf8".into()))?
                     .to_owned();
+                result.push(json_quote(&s));
+            }
+            result
+        }
+        TAG_STRPREFIX_HEX => {
+            let pfx_len     = rd_varint!();
+            let pfx_bytes   = rd_bytes!(pfx_len);
+            let prefix = std::str::from_utf8(pfx_bytes)
+                .map_err(|_| ScteError::DecodeError("columnar: TAG_STRPREFIX_HEX bad utf8".into()))?;
+            let hex_byte_len = rd_varint!();
+            let hex_char_len = hex_byte_len * 2;
+            let mut result = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                let packed = rd_bytes!(hex_byte_len);
+                let mut s = String::with_capacity(pfx_len + hex_char_len);
+                s.push_str(prefix);
+                for &byte in packed {
+                    static HEX: &[u8; 16] = b"0123456789abcdef";
+                    s.push(HEX[(byte >> 4) as usize] as char);
+                    s.push(HEX[(byte & 0x0F) as usize] as char);
+                }
                 result.push(json_quote(&s));
             }
             result

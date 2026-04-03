@@ -74,7 +74,10 @@ fn infers_nested_field_path() {
 }
 
 #[test]
-fn high_cardinality_field_is_str() {
+fn high_cardinality_prefix_int_is_strprefix() {
+    // "u0".."u64" share a common prefix "u" with variable-width integer suffixes.
+    // The inferencer should recognise the prefix pattern and return StrPrefix,
+    // not fall back to Str, regardless of cardinality.
     let entries: String = (0..65)
         .map(|i| format!(r#"{{"name":"u{i}"}}"#))
         .collect::<Vec<_>>()
@@ -82,7 +85,8 @@ fn high_cardinality_field_is_str() {
     let json = format!("[{entries}]");
     let toks = tokenize_json(json.as_bytes()).unwrap();
     let s    = FileSchema::build(&toks);
-    assert_eq!(s.field_type("name"), Some(&FieldType::Str));
+    assert!(matches!(s.field_type("name"), Some(FieldType::StrPrefix { .. })),
+        "expected StrPrefix, got {:?}", s.field_type("name"));
 }
 
 // ── 2. Serializer roundtrip ───────────────────────────────────────────────────
