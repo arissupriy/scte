@@ -251,8 +251,8 @@ fn benchmark_summary() {
 
     println!();
     println!("{:=<148}", "");
-    println!("  SCTE encoding results");
-    println!("  Build: debug (throughput in debug build — run with --release for representative numbers)");
+    let build = if cfg!(debug_assertions) { "debug  (run with --release for representative throughput numbers)" } else { "release" };
+    println!("  SCTE encoding results  [build: {build}]");
     println!("  All rows verified: decode(encode(input)) == input (canonical JSON comparison)");
     println!("  zstd columns are reference data only.");
     println!("  [periodic] = all fields cycle with small periods — columnar period detector stores base cycle only.");
