@@ -8,6 +8,7 @@ use crate::{
         Dictionary,
         decode_token_stream,
         tokens_to_json,
+        decode_columnar,
     },
     schema::serializer as schema_ser,
     types::{PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
@@ -72,6 +73,7 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
     let mut dict_payload:   Option<&[u8]> = None;
     let mut token_payload:  Option<&[u8]> = None;
     let mut delta_payload:  &[u8]         = &[];
+    let mut columnar_payload: Option<&[u8]> = None;
 
     for (idx, section) in sections.iter().enumerate() {
         let start = section.offset as usize;
@@ -82,12 +84,18 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
         section.verify_payload(payload, idx)?;
 
         match section.section_type {
-            SectionType::Schema => schema_payload = Some(payload),
-            SectionType::Dict   => dict_payload   = Some(payload),
-            SectionType::Tokens => token_payload  = Some(payload),
-            SectionType::Delta  => delta_payload  = payload,
+            SectionType::Schema   => schema_payload   = Some(payload),
+            SectionType::Dict     => dict_payload     = Some(payload),
+            SectionType::Tokens   => token_payload    = Some(payload),
+            SectionType::Delta    => delta_payload    = payload,
+            SectionType::Columnar => columnar_payload = Some(payload),
             _ => {}
         }
+    }
+
+    // Fast path: columnar-encoded Array<Object>
+    if let Some(col_data) = columnar_payload {
+        return decode_columnar(col_data);
     }
 
     let schema_bytes = schema_payload

@@ -1,5 +1,6 @@
 pub mod canonicalize;
 pub mod columnar;
+pub mod columnar_pipeline;
 pub mod delta;
 pub mod dictionary;
 pub mod entropic;
@@ -15,6 +16,7 @@ pub use two_pass::{TwoPassOutput, encode_json_two_pass, decode_token_stream,
 
 pub use canonicalize::canonicalize_json;
 pub use columnar::{ColumnStream, ColumnValue, ColumnarBatch, is_homogeneous_array};
+pub use columnar_pipeline::{detect_homogeneous_array, encode_columnar, decode_columnar};
 pub use dictionary::{Dictionary, DictEntry, DictEntryKind, EncodedToken, EncodedPayload,
                      encode_with_dict, decode_with_dict};
 pub use entropic::{encode_token_bytes, decode_token_bytes, kind_to_byte, byte_to_kind,

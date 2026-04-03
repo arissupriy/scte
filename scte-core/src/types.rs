@@ -77,6 +77,8 @@ pub enum SectionType {
     Meta   = 0x07,
     /// Inferred field schema — field types, enum mappings, encoding hints (Phase 5).
     Schema = 0x08,
+    /// Columnar encoding — column-major layout for Array<Object> JSON (Phase 2).
+    Columnar = 0x09,
 }
 
 impl SectionType {
@@ -90,6 +92,7 @@ impl SectionType {
             0x06 => Some(Self::Data),
             0x07 => Some(Self::Meta),
             0x08 => Some(Self::Schema),
+            0x09 => Some(Self::Columnar),
             _    => None,
         }
     }

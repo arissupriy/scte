@@ -4,7 +4,8 @@ use crate::{
         section::{SectionEntry, SECTION_ENTRY_FIXED_SIZE},
     },
     error::ScteError,
-    pipelines::text::{encode_json_two_pass, TwoPassOutput},
+    pipelines::text::{encode_json_two_pass, TwoPassOutput,
+                      detect_homogeneous_array, encode_columnar},
     types::{PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
 };
 
@@ -44,9 +45,43 @@ fn looks_like_json(input: &[u8]) -> bool {
 }
 
 fn encode_json(input: &[u8]) -> Result<Vec<u8>, ScteError> {
+    // Try columnar path first (Array<Object> with uniform schema).
+    if detect_homogeneous_array(input) {
+        if let Ok(columnar_bytes) = encode_columnar(input) {
+            return assemble_columnar_container(input.len(), &columnar_bytes);
+        }
+    }
+    // Fall back to row-major two-pass pipeline.
     let out = encode_json_two_pass(input, 2)?;
     assemble_text_container(input.len(), &out)
 }
+
+// ── Columnar path ────────────────────────────────────────────────────────────
+
+/// Assemble a SCTE container for `PipelineId::Text` carrying a single
+/// COLUMNAR section (type 0x09). Replaces the full SCHEMA+DICT+TOKENS+DELTA
+/// layout for Array<Object> JSON inputs.
+pub(crate) fn assemble_columnar_container(
+    original_len: usize,
+    columnar_bytes: &[u8],
+) -> Result<Vec<u8>, ScteError> {
+    let section_count: u16 = 1;
+    let section_tbl   = SECTION_ENTRY_FIXED_SIZE * section_count as usize;
+    let header_size   = HEADER_SIZE + section_tbl;
+
+    let col_off: u64 = header_size as u64;
+    let col_sec  = SectionEntry::new(SectionType::Columnar, SectionCodec::None, col_off, columnar_bytes);
+    let header   = ScteHeader::new(PipelineId::Text, original_len as u64, section_count);
+
+    let total = header_size + columnar_bytes.len();
+    let mut result = Vec::with_capacity(total);
+    result.extend_from_slice(&header.write());
+    result.extend_from_slice(&col_sec.write());
+    result.extend_from_slice(columnar_bytes);
+    Ok(result)
+}
+
+// ── Text (row-major) path ────────────────────────────────────────────────────
 
 /// Assemble a SCTE container for `PipelineId::Text`.
 ///
