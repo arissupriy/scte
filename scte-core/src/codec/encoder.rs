@@ -85,11 +85,14 @@ pub fn encode(input: &[u8]) -> Result<Vec<u8>, ScteError> {
 fn encode_structured(input: &[u8]) -> Result<Vec<u8>, ScteError> {
     if looks_like_json(input) {
         // `looks_like_json` is a heuristic (first byte is `{` or `[`).
-        // If the content turns out to be invalid JSON (e.g. a log file that
-        // starts with `[timestamp]`), fall back silently to passthrough so
-        // that all inputs are always accepted and decoded byte-exactly.
+        // Two silent fall-through cases:
+        //   1. The content is invalid JSON (e.g. a log starting with `[ts]`).
+        //   2. The pipeline overhead exceeds the gain — this happens for small
+        //      payloads where schema + section table cost > compression savings.
+        //      In that case passthrough is always smaller and byte-exact.
         match encode_json(input) {
-            Ok(v) => return Ok(v),
+            Ok(v) if v.len() < input.len() => return Ok(v),
+            Ok(_) => { /* pipeline inflated — fall through to passthrough */ }
             Err(_) => { /* not actually JSON — fall through to passthrough */ }
         }
     }
@@ -260,11 +263,33 @@ mod tests {
 
     #[test]
     fn encode_json_uses_text_pipeline() {
-        let json = br#"[{"id":1,"status":"ok"},{"id":2,"status":"fail"}]"#;
-        let out  = encode(json).unwrap();
+        // Use enough rows that the pipeline overhead is smaller than the gain.
+        // 50 uniform rows compress well; a 2-row array would inflate and
+        // correctly fall back to passthrough.
+        let records: String = (0..50)
+            .map(|i| {
+                let s = if i % 2 == 0 { "ok" } else { "fail" };
+                format!(r#"{{"id":{i},"status":"{s}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!("[{records}]").into_bytes();
+        let out  = encode(&json).unwrap();
         assert_eq!(&out[0..4], b"SCTE");
         // Pipeline ID byte is at offset 6 in the header; 0x01 = Text
         assert_eq!(out[6], 0x01, "expected PipelineId::Text for JSON input");
+    }
+
+    #[test]
+    fn small_json_falls_back_to_passthrough() {
+        // A tiny JSON object has more overhead than gain → must not inflate.
+        let json = br#"{"name":"Alice","age":30,"city":"Jakarta"}"#;
+        let out  = encode(json).unwrap();
+        assert!(
+            out.len() <= json.len() + HEADER_SIZE + SECTION_ENTRY_FIXED_SIZE,
+            "small JSON ({} B input) should not inflate beyond passthrough size, got {} B",
+            json.len(), out.len()
+        );
     }
 
     #[test]
