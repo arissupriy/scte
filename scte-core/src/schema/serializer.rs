@@ -30,13 +30,15 @@ use crate::varint::{decode_usize, encode_usize};
 
 // ── Tag constants ─────────────────────────────────────────────────────────────
 
-const TAG_INTEGER:   u8 = 0x00;
-const TAG_FLOAT:     u8 = 0x01;
-const TAG_BOOL:      u8 = 0x02;
-const TAG_ENUM:      u8 = 0x03;
-const TAG_TIMESTAMP: u8 = 0x04;
-const TAG_STR:       u8 = 0x05;
-const TAG_NULL:      u8 = 0x06;
+const TAG_INTEGER:    u8 = 0x00;
+const TAG_FLOAT:      u8 = 0x01;
+const TAG_BOOL:       u8 = 0x02;
+const TAG_ENUM:       u8 = 0x03;
+const TAG_TIMESTAMP:  u8 = 0x04;
+const TAG_STR:        u8 = 0x05;
+const TAG_NULL:       u8 = 0x06;
+const TAG_STR_PREFIX: u8 = 0x07;
+const TAG_FLOAT_FIXED: u8 = 0x08;
 
 const HINT_FLAT:       u8 = 0x00;
 const HINT_SEQUENTIAL: u8 = 0x01;
@@ -77,6 +79,17 @@ pub fn serialize(schema: &FileSchema) -> Vec<u8> {
                     encode_usize(b.len(), &mut out);
                     out.extend_from_slice(b);
                 }
+            }
+            FieldType::StrPrefix { prefix, suffix_width } => {
+                out.push(TAG_STR_PREFIX);
+                let b = prefix.as_bytes();
+                encode_usize(b.len(), &mut out);
+                out.extend_from_slice(b);
+                out.push(*suffix_width);
+            }
+            FieldType::FloatFixed { decimals } => {
+                out.push(TAG_FLOAT_FIXED);
+                out.push(*decimals);
             }
         }
     }
@@ -148,6 +161,27 @@ pub fn deserialize(data: &[u8]) -> Result<FileSchema, ScteError> {
                     variants.push(s);
                 }
                 FieldType::Enum { variants }
+            }
+            TAG_STR_PREFIX => {
+                let (plen, consumed) = decode_usize(data, pos)
+                    .ok_or_else(|| ScteError::DecodeError("schema: truncated StrPrefix len".into()))?;
+                pos += consumed;
+                let pbytes = data.get(pos..pos + plen)
+                    .ok_or_else(|| ScteError::DecodeError("schema: truncated StrPrefix bytes".into()))?;
+                let prefix = std::str::from_utf8(pbytes)
+                    .map_err(|_| ScteError::DecodeError("schema: invalid UTF-8 in StrPrefix".into()))?
+                    .to_owned();
+                pos += plen;
+                let suffix_width = *data.get(pos)
+                    .ok_or_else(|| ScteError::DecodeError("schema: missing StrPrefix suffix_width".into()))?;
+                pos += 1;
+                FieldType::StrPrefix { prefix, suffix_width }
+            }
+            TAG_FLOAT_FIXED => {
+                let decimals = *data.get(pos)
+                    .ok_or_else(|| ScteError::DecodeError("schema: missing FloatFixed decimals".into()))?;
+                pos += 1;
+                FieldType::FloatFixed { decimals }
             }
             other => {
                 return Err(ScteError::DecodeError(format!(

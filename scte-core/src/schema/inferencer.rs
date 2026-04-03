@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use crate::pipelines::text::tokenizer::{Token, TokenKind, TokenPayload};
+use crate::pipelines::text::pattern::string_prefix::detect_prefix_pattern;
 use crate::schema::field_type::{FieldType, IntHint};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -25,6 +26,9 @@ use crate::schema::field_type::{FieldType, IntHint};
 /// Maximum number of unique string values a field may have to be treated as
 /// an enum. Fields with more unique values are classified as `Str`.
 pub const MAX_ENUM_VARIANTS: usize = 64;
+
+/// Maximum number of integer values sampled per field for `IntHint` detection.
+const MAX_INT_SAMPLE: usize = 1_000;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -74,11 +78,13 @@ impl FileSchema {
                 }
 
                 TokenKind::NumInt => {
-                    record_value(&ctx, &mut obs, |o| o.push_int());
+                    let val = if let TokenPayload::Int(v) = token.payload { v } else { 0 };
+                    record_value(&ctx, &mut obs, |o| o.push_int_val(val));
                     ctx.clear_key();
                 }
                 TokenKind::NumFloat => {
-                    record_value(&ctx, &mut obs, |o| o.push_float());
+                    let val = if let TokenPayload::Float(v) = token.payload { v } else { 0.0 };
+                    record_value(&ctx, &mut obs, |o| o.push_float_val(val));
                     ctx.clear_key();
                 }
                 TokenKind::Bool => {
@@ -217,16 +223,89 @@ struct FieldObs {
     /// Observed string values → count.
     str_values:  BTreeMap<String, u64>,
     total:       u64,
+    /// Sampled integer values (capped at MAX_INT_SAMPLE) for IntHint analysis.
+    int_values:  Vec<i64>,
+    /// Sampled float values (capped at MAX_INT_SAMPLE) for FloatFixed analysis.
+    float_values: Vec<f64>,
 }
 
 impl FieldObs {
-    fn push_int(&mut self)           { self.int_count   += 1; self.total += 1; }
-    fn push_float(&mut self)         { self.float_count += 1; self.total += 1; }
+    fn push_int_val(&mut self, v: i64) {
+        self.int_count += 1;
+        self.total     += 1;
+        if self.int_values.len() < MAX_INT_SAMPLE {
+            self.int_values.push(v);
+        }
+    }
+    fn push_float_val(&mut self, v: f64) {
+        self.float_count += 1;
+        self.total       += 1;
+        if self.float_values.len() < MAX_INT_SAMPLE {
+            self.float_values.push(v);
+        }
+    }
     fn push_bool(&mut self)          { self.bool_count  += 1; self.total += 1; }
     fn push_null(&mut self)          { self.null_count  += 1; self.total += 1; }
     fn push_str(&mut self, s: &str)  {
         *self.str_values.entry(s.to_owned()).or_insert(0) += 1;
         self.total += 1;
+    }
+
+    /// Detect the minimum decimal precision at which all sampled floats are
+    /// exactly representable as integers (after scaling by 10^decimals).
+    ///
+    /// Returns `Some(decimals)` (0–6) if found, `None` if no clean fit.
+    fn compute_float_fixed(&self) -> Option<u8> {
+        if self.float_values.is_empty() { return None; }
+        for decimals in 0u8..=6 {
+            let scale = 10f64.powi(decimals as i32);
+            if self.float_values.iter().all(|&v| {
+                let scaled = v * scale;
+                (scaled - scaled.round()).abs() < 1e-6
+            }) {
+                return Some(decimals);
+            }
+        }
+        None
+    }
+
+    /// Detect the `IntHint` from the sampled integer values.
+    /// Requires at least 2 values; falls back to `Flat` otherwise.
+    fn compute_int_hint(&self) -> IntHint {
+        let vals = &self.int_values;
+        if vals.len() < 2 {
+            return IntHint::Flat;
+        }
+
+        let deltas: Vec<i64> = vals.windows(2).map(|w| w[1] - w[0]).collect();
+
+        // Sequential: all inter-record deltas are equal (constant step).
+        if deltas.iter().all(|&d| d == deltas[0]) {
+            return IntHint::Sequential;
+        }
+
+        // Monotonic: all deltas are non-negative (strictly or non-strictly
+        // increasing) — delta encoding still compresses better than flat.
+        if deltas.iter().all(|&d| d >= 0) {
+            return IntHint::Monotonic;
+        }
+
+        // Clustered: the median absolute delta is small relative to the
+        // total range of the field (values stay near their neighbours).
+        let min = *vals.iter().min().unwrap();
+        let max = *vals.iter().max().unwrap();
+        let range = max - min;
+        if range > 0 {
+            let mut abs_deltas: Vec<i64> = deltas.iter().map(|d| d.abs()).collect();
+            abs_deltas.sort_unstable();
+            let median = abs_deltas[abs_deltas.len() / 2];
+            // Clustered if median |Δ| ≤ 10 % of range.
+            if median * 10 <= range {
+                return IntHint::Clustered;
+            }
+        }
+
+        IntHint::Flat
     }
 
     /// Infer the best `FieldType` from accumulated observations.
@@ -242,11 +321,19 @@ impl FieldObs {
 
         // ── Pure integer ──────────────────────────────────────────────────────
         if self.int_count == non_null_total {
-            return FieldType::Integer { hint: IntHint::Flat };
+            return FieldType::Integer { hint: self.compute_int_hint() };
         }
 
         // ── Pure float (or int+float mix treated as float) ────────────────────
         if num_count == non_null_total && self.bool_count == 0 && str_count == 0 {
+            // If all float values fit in a fixed decimal representation, use FloatFixed
+            // for better delta compression. Only classify as FloatFixed if there are
+            // genuine float values (int+float mix stays as Float).
+            if self.float_count == non_null_total {
+                if let Some(decimals) = self.compute_float_fixed() {
+                    return FieldType::FloatFixed { decimals };
+                }
+            }
             return FieldType::Float;
         }
 
@@ -278,6 +365,30 @@ impl FieldObs {
                 let variant_strings: Vec<String> =
                     variants.into_iter().map(|(k, _)| k).collect();
                 return FieldType::Enum { variants: variant_strings };
+            }
+
+            // High-cardinality: check for StrPrefix pattern (e.g. "user_0001")
+            {
+                let str_refs: Vec<&str> = self.str_values.keys().map(|s| s.as_str()).collect();
+                let (pfx, _) = detect_prefix_pattern(&str_refs);
+                if !pfx.is_empty() {
+                    // Detect zero-padding width from suffix strings.
+                    // If all suffixes have the same character length *and*
+                    // at least one starts with '0' (meaning zero-padding is in use),
+                    // store that length so decoding can restore leading zeros.
+                    let suffixes: Vec<&str> = str_refs.iter()
+                        .filter_map(|s| s.strip_prefix(pfx.as_str()))
+                        .collect();
+                    let first_len = suffixes.first().map(|s| s.len()).unwrap_or(0);
+                    let has_leading_zero = suffixes.iter().any(|s| s.starts_with('0') && s.len() > 1);
+                    let all_same_len    = suffixes.iter().all(|s| s.len() == first_len);
+                    let suffix_width: u8 = if has_leading_zero && all_same_len && first_len <= 20 {
+                        first_len as u8
+                    } else {
+                        0
+                    };
+                    return FieldType::StrPrefix { prefix: pfx, suffix_width };
+                }
             }
 
             return FieldType::Str;
@@ -328,10 +439,28 @@ mod tests {
     }
 
     #[test]
-    fn detects_integer_field() {
+    fn detects_integer_field_sequential() {
+        // 1,2,3 → constant delta +1 → Sequential
         let json = r#"[{"id":1},{"id":2},{"id":3}]"#;
         let s = build(json);
-        assert_eq!(s.field_type("id"), Some(&FieldType::Integer { hint: IntHint::Flat }));
+        assert_eq!(s.field_type("id"), Some(&FieldType::Integer { hint: IntHint::Sequential }));
+    }
+
+    #[test]
+    fn detects_integer_hint_flat() {
+        // Alternating −10 000 / +10 000 → not Sequential/Monotonic/Clustered
+        let json = r#"[{"x":0},{"x":10000},{"x":0},{"x":10000}]"#;
+        let s = build(json);
+        // range=10000, deltas=[10000,-10000,10000], median=10000, 10000*10=100000 > 10000 → Flat
+        assert_eq!(s.field_type("x"), Some(&FieldType::Integer { hint: IntHint::Flat }));
+    }
+
+    #[test]
+    fn detects_integer_hint_monotonic() {
+        // Increasing with varying steps: not equal → not Sequential, all ≥0 → Monotonic
+        let json = r#"[{"ts":100},{"ts":105},{"ts":107},{"ts":200}]"#;
+        let s = build(json);
+        assert_eq!(s.field_type("ts"), Some(&FieldType::Integer { hint: IntHint::Monotonic }));
     }
 
     #[test]
@@ -367,14 +496,35 @@ mod tests {
 
     #[test]
     fn high_cardinality_string_is_str_not_enum() {
-        // 65 unique names → Str, not Enum
+        // 65 unique names with prefix+int pattern → StrPrefix, not Enum
         let entries: String = (0..65)
             .map(|i| format!(r#"{{"name":"user_{i}"}}"#))
             .collect::<Vec<_>>()
             .join(",");
         let json = format!("[{entries}]");
         let s = build(&json);
-        assert_eq!(s.field_type("name"), Some(&FieldType::Str));
+        assert!(matches!(s.field_type("name"), Some(FieldType::StrPrefix { .. })),
+            "expected StrPrefix, got {:?}", s.field_type("name"));
+    }
+
+    #[test]
+    fn truly_random_strings_are_str() {
+        // Strings sharing no common prefix → Str
+        let entries: String = ["alpha","beta","gamma","delta","epsilon","zeta","eta","theta",
+            "iota","kappa","lambda","mu","nu","xi","omicron","pi",
+            "rho","sigma","tau","upsilon","phi","chi","psi","omega",
+            "foo","bar","baz","qux","quux","corge","grault","garply",
+            "waldo","fred","plugh","xyzzy","thud","lorem","ipsum","dolor",
+            "sit","amet","consectetur","adipiscing","elit","sed","eiusmod","tempor",
+            "incididunt","labore","dolore","magna","aliqua","enim","veniam","quis",
+            "nostrud","exercitation","ullamco","laboris","nisi","aliquip","commodo","consequat","extra"]
+            .iter()
+            .map(|n| format!(r#"{{"word":"{n}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!("[{entries}]");
+        let s = build(&json);
+        assert_eq!(s.field_type("word"), Some(&FieldType::Str));
     }
 
     #[test]

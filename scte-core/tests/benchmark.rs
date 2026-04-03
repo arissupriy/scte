@@ -1,0 +1,190 @@
+/// Phase 1 benchmark — SCTE vs zstd level 3 / level 19
+///
+/// Run with:
+///   cargo test --test benchmark -- --nocapture
+///
+/// Requires `zstd` binary on PATH.
+
+use std::process::Command;
+use scte_core::{encode, decode, canonicalize_json};
+
+// ── Data generators ───────────────────────────────────────────────────────────
+
+/// JSON array of structured log records (same schema as phase7_pipeline tests).
+fn gen_log_json(n: usize, seed: u64) -> Vec<u8> {
+    let statuses = ["ok", "error", "timeout", "retry"];
+    let methods  = ["GET", "POST", "PUT", "DELETE"];
+    let mut s = String::with_capacity(n * 100);
+    s.push('[');
+    let mut lcg = seed;
+    for i in 0..n {
+        if i > 0 { s.push(','); }
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let status   = statuses[(lcg >> 33) as usize % 4];
+        let method   = methods[(lcg >> 17) as usize % 4];
+        let path_id  = (lcg >> 5) % 101;
+        let latency  = (lcg >> 20) % 500 + 1;
+        let success  = (lcg >> 8) & 1 == 0;
+        s.push_str(&format!(
+            r#"{{"id":{i},"status":"{status}","method":"{method}","latency_ms":{latency},"path":"/api/v1/res/{path_id}","success":{success}}}"#
+        ));
+    }
+    s.push(']');
+    s.into_bytes()
+}
+
+/// JSON array of "API response" records with nested objects — typical REST response.
+fn gen_api_json(n: usize) -> Vec<u8> {
+    let roles    = ["admin", "user", "viewer", "moderator"];
+    let regions  = ["us-east-1", "eu-west-1", "ap-southeast-1", "us-west-2"];
+    let statuses = ["active", "inactive", "pending", "suspended"];
+    let mut s = String::with_capacity(n * 150);
+    s.push('[');
+    for i in 0..n {
+        if i > 0 { s.push(','); }
+        let role   = roles[i % 4];
+        let region = regions[i % 4];
+        let status = statuses[i % 4];
+        let score  = (i % 100) as f64 * 0.01;
+        s.push_str(&format!(
+            r#"{{"id":{i},"user":{{"name":"user_{i:04}","role":"{role}","score":{score:.2}}},"region":"{region}","status":"{status}","created_at":"2026-01-{:02}T12:00:00Z"}}"#,
+            (i % 28) + 1
+        ));
+    }
+    s.push(']');
+    s.into_bytes()
+}
+
+// ── zstd helper ───────────────────────────────────────────────────────────────
+
+/// Compress `data` with `zstd` at the given level using the CLI binary.
+/// Returns compressed length (or panics with a descriptive message if zstd is
+/// not found on PATH).
+fn zstd_compress(data: &[u8], level: i32) -> usize {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("zstd")
+        .args([&format!("-{level}"), "--no-progress", "-q", "-c", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("zstd not found — install zstd on PATH");
+
+    child.stdin.take().unwrap().write_all(data).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "zstd exited non-zero");
+    out.stdout.len()
+}
+
+// ── Benchmark helper ──────────────────────────────────────────────────────────
+
+fn bench(label: &str, data: &[u8]) {
+    let raw = data.len();
+
+    // SCTE encode
+    let encoded      = encode(data).expect("scte encode failed");
+    let scte_len     = encoded.len();
+    let scte_ratio   = scte_len as f64 / raw as f64 * 100.0;
+
+    // Roundtrip verify — compare canonical JSON because the pipeline sorts
+    // object keys, so the decoded byte sequence may differ from the input.
+    let decoded = decode(&encoded).expect("scte decode failed");
+    let canon_in  = canonicalize_json(data)  .expect("canonicalize input failed");
+    let canon_out = canonicalize_json(&decoded).expect("canonicalize decoded failed");
+    assert_eq!(canon_in, canon_out, "roundtrip mismatch for '{label}'");
+
+    // zstd baselines
+    let zstd3_len  = zstd_compress(data, 3);
+    let zstd19_len = zstd_compress(data, 19);
+    let zstd3_ratio  = zstd3_len  as f64 / raw as f64 * 100.0;
+    let zstd19_ratio = zstd19_len as f64 / raw as f64 * 100.0;
+
+    println!(
+        "{label:40}  raw={raw:>8}B  scte={scte_len:>8}B ({scte_ratio:5.1}%)  \
+         zstd-3={zstd3_len:>8}B ({zstd3_ratio:5.1}%)  \
+         zstd-19={zstd19_len:>8}B ({zstd19_ratio:5.1}%)"
+    );
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn benchmark_log_1k() {
+    let data = gen_log_json(1_000, 42);
+    bench("log-json 1k records", &data);
+}
+
+#[test]
+fn benchmark_log_5k() {
+    let data = gen_log_json(5_000, 42);
+    bench("log-json 5k records", &data);
+}
+
+#[test]
+fn benchmark_log_10k() {
+    let data = gen_log_json(10_000, 42);
+    bench("log-json 10k records", &data);
+}
+
+#[test]
+fn benchmark_api_1k() {
+    let data = gen_api_json(1_000);
+    bench("api-json 1k records", &data);
+}
+
+#[test]
+fn benchmark_api_5k() {
+    let data = gen_api_json(5_000);
+    bench("api-json 5k records", &data);
+}
+
+#[test]
+fn benchmark_summary() {
+    println!();
+    println!("{:=<100}", "");
+    println!("  SCTE Phase 1 — Compression Benchmark (vs zstd)");
+    println!("{:=<100}", "");
+    println!(
+        "{:<40}  {:>9}  {:>14}  {:>14}  {:>15}",
+        "Dataset", "Raw", "SCTE", "zstd -3", "zstd -19"
+    );
+    println!("{:-<100}", "");
+
+    for (label, data) in &[
+        ("log-json  1k",   gen_log_json(1_000,  42)),
+        ("log-json  5k",   gen_log_json(5_000,  42)),
+        ("log-json 10k",   gen_log_json(10_000, 42)),
+        ("api-json  1k",   gen_api_json(1_000)),
+        ("api-json  5k",   gen_api_json(5_000)),
+        ("api-json 10k",   gen_api_json(10_000)),
+    ] {
+        let raw          = data.len();
+        let encoded      = encode(data).unwrap();
+        let scte_len     = encoded.len();
+        let zstd3_len    = zstd_compress(data, 3);
+        let zstd19_len   = zstd_compress(data, 19);
+
+        let scte_pct   = scte_len   as f64 / raw as f64 * 100.0;
+        let zstd3_pct  = zstd3_len  as f64 / raw as f64 * 100.0;
+        let zstd19_pct = zstd19_len as f64 / raw as f64 * 100.0;
+
+        // Verify roundtrip — canonical comparison (pipeline sorts keys)
+        let decoded   = decode(&encoded).unwrap();
+        let canon_in  = canonicalize_json(data)    .expect("canonicalize input failed");
+        let canon_out = canonicalize_json(&decoded).expect("canonicalize decoded failed");
+        assert_eq!(canon_in, canon_out, "roundtrip mismatch for '{label}'");
+
+        let beats_zstd3 = if scte_len < zstd3_len { "✓" } else { " " };
+        println!(
+            "  {label:<38}  {raw:>8}B  {scte_len:>7}B {scte_pct:5.1}%  \
+             {zstd3_len:>7}B {zstd3_pct:5.1}%  \
+             {zstd19_len:>7}B {zstd19_pct:5.1}%  {beats_zstd3}"
+        );
+    }
+
+    println!("{:=<100}", "");
+    println!("  ✓ = SCTE beats zstd -3");
+    println!();
+}

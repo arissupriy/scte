@@ -31,9 +31,20 @@ pub enum FieldType {
     /// Phase 5 stores this mapping in the SCHEMA section.
     Enum { variants: Vec<String> },
     /// Timestamp string — ISO 8601 or Unix epoch.
+    /// Encoded as delta-compressed Unix epoch seconds (NumInt) in the token stream.
     Timestamp,
     /// Arbitrary string — no pattern detected.
     Str,
     /// Always null.
     Null,
+    /// High-cardinality string field where values follow `<prefix><integer>` pattern.
+    ///
+    /// E.g. `"user_0042"` → prefix `"user_"`, suffix `42`.  
+    /// The suffix integer is stored as `NumInt` and delta-encoded.
+    /// `suffix_width` is the zero-padded width (0 = no padding).
+    StrPrefix { prefix: String, suffix_width: u8 },
+    /// Float field where all observed values have at most `decimals` decimal places.
+    ///
+    /// Encoded as `round(v × 10^decimals)` integer (NumInt), delta-compressed.
+    FloatFixed { decimals: u8 },
 }

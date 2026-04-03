@@ -28,7 +28,7 @@
 /// responsible for writing these to the SCTE container.
 
 use crate::error::ScteError;
-use crate::schema::FieldType;
+use crate::schema::{FieldType, IntHint};
 use std::collections::HashMap;
 use crate::pipelines::text::{
     dictionary::Dictionary,
@@ -37,6 +37,7 @@ use crate::pipelines::text::{
     tokenize_json,
 };
 use crate::pipelines::text::tokenizer::{Token, TokenKind, TokenPayload};
+use crate::pipelines::text::delta::timestamp::{parse_timestamp, epoch_to_iso8601};
 use crate::schema::inferencer::FileSchema;
 use crate::schema::serializer;
 
@@ -107,9 +108,11 @@ pub fn decode_token_stream(
 ) -> Result<Vec<Token>, ScteError> {
     let encoded        = decode_token_bytes(token_bytes)?;
     let tokens         = decode_with_dict(&encoded, dict)?;
-    let schema_decoded = schema_decode_tokens(&tokens, schema);
-    let delta_decoded  = delta_decode_tokens(&schema_decoded, schema, delta_bytes);
-    Ok(delta_decoded)
+    // Delta must be un-done BEFORE schema decode, because schema_decode converts
+    // NumInt(delta) → Str for StrPrefix/FloatFixed/Timestamp fields.
+    let delta_decoded  = delta_decode_tokens(&tokens, schema, delta_bytes);
+    let schema_decoded = schema_decode_tokens(&delta_decoded, schema);
+    Ok(schema_decoded)
 }
 
 // ── Schema-aware token rewriting ──────────────────────────────────────────────
@@ -142,24 +145,55 @@ pub fn schema_encode_tokens(tokens: &[Token], schema: &FileSchema) -> Vec<Token>
 
             TokenKind::Str => {
                 let path = ctx.current_path();
-                // Try to encode as enum index
-                if let (TokenPayload::Str(ref s), Some(idx)) = (
-                    &token.payload,
-                    schema.enum_variant_index(&path, token_str(token)),
-                ) {
-                    let _ = s; // consumed in enum_variant_index
-                    out.push(Token {
-                        kind:    TokenKind::NumInt,
-                        payload: TokenPayload::Int(idx as i64),
-                    });
-                } else {
-                    out.push(token.clone());
-                }
+                let rewritten = match (schema.field_type(&path), &token.payload) {
+                    // Enum: replace string with variant index
+                    (Some(FieldType::Enum { .. }), TokenPayload::Str(s)) => {
+                        schema.enum_variant_index(&path, s).map(|idx| Token {
+                            kind:    TokenKind::NumInt,
+                            payload: TokenPayload::Int(idx as i64),
+                        })
+                    }
+                    // StrPrefix: strip prefix, parse integer suffix
+                    (Some(FieldType::StrPrefix { prefix, .. }), TokenPayload::Str(s)) => {
+                        s.strip_prefix(prefix.as_str())
+                            .and_then(|suffix| suffix.parse::<i64>().ok())
+                            .map(|n| Token {
+                                kind:    TokenKind::NumInt,
+                                payload: TokenPayload::Int(n),
+                            })
+                    }
+                    // Timestamp: parse to epoch seconds
+                    (Some(FieldType::Timestamp), TokenPayload::Str(s)) => {
+                        parse_timestamp(s).map(|epoch| Token {
+                            kind:    TokenKind::NumInt,
+                            payload: TokenPayload::Int(epoch),
+                        })
+                    }
+                    _ => None,
+                };
+                out.push(rewritten.unwrap_or_else(|| token.clone()));
                 ctx.clear_key();
             }
 
-            // Numeric / bool / null: pass through, clear key context
-            TokenKind::NumInt | TokenKind::NumFloat | TokenKind::Bool | TokenKind::Null => {
+            TokenKind::NumFloat => {
+                let path = ctx.current_path();
+                if let (Some(FieldType::FloatFixed { decimals }), TokenPayload::Float(v))
+                    = (schema.field_type(&path), &token.payload)
+                {
+                    let scale = 10f64.powi(*decimals as i32);
+                    out.push(Token {
+                        kind:    TokenKind::NumInt,
+                        payload: TokenPayload::Int((*v * scale).round() as i64),
+                    });
+                    ctx.clear_key();
+                    continue;
+                }
+                out.push(token.clone());
+                ctx.clear_key();
+            }
+
+            // Numeric / bool / null: pass through unchanged
+            TokenKind::NumInt | TokenKind::Bool | TokenKind::Null => {
                 out.push(token.clone());
                 ctx.clear_key();
             }
@@ -168,7 +202,7 @@ pub fn schema_encode_tokens(tokens: &[Token], schema: &FileSchema) -> Vec<Token>
     out
 }
 
-/// Restore enum-encoded `NumInt` tokens back to their `Str` values.
+
 ///
 /// A `NumInt` at a path the schema classifies as `Enum` is decoded back to
 /// `Str(variants[idx])`.  A `NumInt` at a path the schema classifies as
@@ -194,11 +228,42 @@ pub fn schema_decode_tokens(tokens: &[Token], schema: &FileSchema) -> Vec<Token>
 
             TokenKind::NumInt => {
                 let path = ctx.current_path();
-                if let TokenPayload::Int(idx) = token.payload {
-                    if let Some(s) = schema.enum_variant_str(&path, idx as u32) {
+                if let TokenPayload::Int(v) = token.payload {
+                    // Enum: integer index → string variant
+                    if let Some(s) = schema.enum_variant_str(&path, v as u32) {
+                        out.push(Token { kind: TokenKind::Str, payload: TokenPayload::Str(s.to_owned()) });
+                        ctx.clear_key();
+                        continue;
+                    }
+                    // StrPrefix: integer suffix → prefix + suffix (with optional zero-padding)
+                    if let Some(FieldType::StrPrefix { prefix, suffix_width }) = schema.field_type(&path) {
+                        let suffix_str = if *suffix_width > 0 {
+                            format!("{:0>width$}", v, width = *suffix_width as usize)
+                        } else {
+                            format!("{}", v)
+                        };
                         out.push(Token {
                             kind:    TokenKind::Str,
-                            payload: TokenPayload::Str(s.to_owned()),
+                            payload: TokenPayload::Str(format!("{}{}", prefix, suffix_str)),
+                        });
+                        ctx.clear_key();
+                        continue;
+                    }
+                    // FloatFixed: scaled integer → float
+                    if let Some(FieldType::FloatFixed { decimals }) = schema.field_type(&path) {
+                        let scale = 10f64.powi(*decimals as i32);
+                        out.push(Token {
+                            kind:    TokenKind::NumFloat,
+                            payload: TokenPayload::Float(v as f64 / scale),
+                        });
+                        ctx.clear_key();
+                        continue;
+                    }
+                    // Timestamp: epoch seconds → ISO 8601
+                    if let Some(FieldType::Timestamp) = schema.field_type(&path) {
+                        out.push(Token {
+                            kind:    TokenKind::Str,
+                            payload: TokenPayload::Str(epoch_to_iso8601(v)),
                         });
                         ctx.clear_key();
                         continue;
@@ -259,14 +324,6 @@ impl RewriteCtx {
     }
 }
 
-/// Extract string payload from a Str token (panics if not Str token).
-fn token_str(t: &Token) -> &str {
-    match &t.payload {
-        TokenPayload::Str(s) => s.as_str(),
-        _ => "",
-    }
-}
-
 // ── Delta encoding (Phase 6) ──────────────────────────────────────────────────
 
 /// Delta-encode integer fields in a token stream.
@@ -300,7 +357,16 @@ pub fn delta_encode_tokens(tokens: &[Token], schema: &FileSchema) -> (Vec<Token>
 
             TokenKind::NumInt => {
                 let path = ctx.current_path();
-                if matches!(schema.field_type(&path), Some(FieldType::Integer { .. })) {
+                // Only delta-encode fields whose type indicates a pattern:
+                // Integer (non-Flat), StrPrefix, FloatFixed, or Timestamp.
+                let should_delta = match schema.field_type(&path) {
+                    Some(FieldType::Integer { hint }) => !matches!(hint, IntHint::Flat),
+                    Some(FieldType::StrPrefix { .. })
+                    | Some(FieldType::FloatFixed { .. })
+                    | Some(FieldType::Timestamp) => true,
+                    _ => false,
+                };
+                if should_delta {
                     if let TokenPayload::Int(v) = token.payload {
                         let prev  = *last_seen.get(&path).unwrap_or(&0);
                         let delta = v - prev;
@@ -598,17 +664,28 @@ mod tests {
 
     #[test]
     fn non_enum_str_is_unchanged() {
-        // 65 unique names → Str field, not Enum
-        let entries: String = (0..65)
-            .map(|i| format!(r#"{{"name":"user_{i}"}}"#))
-            .collect::<Vec<_>>()
-            .join(",");
-        let json   = format!("[{entries}]");
-        let toks   = tokens(&json);
-        let schema = schema(&json);
+        // Strings with no common prefix-int pattern → not StrPrefix → Str left unchanged
+        let json = r#"[{"tag":"alpha"},{"tag":"beta"},{"tag":"gamma"},{"tag":"delta"},
+            {"tag":"epsilon"},{"tag":"zeta"},{"tag":"eta"},{"tag":"theta"},
+            {"tag":"iota"},{"tag":"kappa"},{"tag":"lambda"},{"tag":"mu"},
+            {"tag":"nu"},{"tag":"xi"},{"tag":"omicron"},{"tag":"pi"},
+            {"tag":"rho"},{"tag":"sigma"},{"tag":"tau"},{"tag":"upsilon"},
+            {"tag":"phi"},{"tag":"chi"},{"tag":"psi"},{"tag":"omega"},
+            {"tag":"foo"},{"tag":"bar"},{"tag":"baz"},{"tag":"qux"},
+            {"tag":"quux"},{"tag":"corge"},{"tag":"grault"},{"tag":"garply"},
+            {"tag":"waldo"},{"tag":"fred"},{"tag":"plugh"},{"tag":"xyzzy"},
+            {"tag":"thud"},{"tag":"lorem"},{"tag":"ipsum"},{"tag":"dolor"},
+            {"tag":"sit"},{"tag":"amet"},{"tag":"consectetur"},{"tag":"adipiscing"},
+            {"tag":"elit"},{"tag":"sed"},{"tag":"eiusmod"},{"tag":"tempor"},
+            {"tag":"incididunt"},{"tag":"labore"},{"tag":"dolore"},{"tag":"magna"},
+            {"tag":"aliqua"},{"tag":"enim"},{"tag":"veniam"},{"tag":"quis"},
+            {"tag":"nostrud"},{"tag":"exercitation"},{"tag":"ullamco"},{"tag":"laboris"},
+            {"tag":"nisi"},{"tag":"aliquip"},{"tag":"commodo"},{"tag":"consequat"},{"tag":"extra"}]"#;
+        let toks   = tokens(json);
+        let schema = schema(json);
         let rw     = schema_encode_tokens(&toks, &schema);
 
-        // Str tokens should remain (no NumInt replacement)
+        // Str tokens should remain (no NumInt replacement for plain Str)
         let orig_str_count = toks.iter().filter(|t| t.kind == TokenKind::Str).count();
         let rw_str_count   = rw.iter().filter(|t| t.kind == TokenKind::Str).count();
         assert_eq!(orig_str_count, rw_str_count);
