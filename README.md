@@ -222,7 +222,8 @@ scte/
 │   │   │       └── pattern/               prefix pattern detection
 │   │   └── schema/          field type inference (Enum/StrPrefix/FloatFixed/Timestamp)
 │   └── tests/
-│       └── benchmark.rs     correctness + throughput tests (real asset files)
+│       ├── benchmark.rs      correctness + throughput tests (real asset files)
+│       └── roundtrip.rs      low-level encode/decode contract tests
 ├── scte-cli/      Command-line encode/decode/inspect
 └── assets/        JSON files used by benchmark tests
 ```
@@ -240,6 +241,9 @@ cargo test --release --lib
 
 # Run integration + benchmark tests (~45 s)
 cargo test --release --test benchmark -- --nocapture
+
+# Run roundtrip contract tests
+cargo test --release --test roundtrip
 
 # Run only correctness tests
 cargo test --release --test benchmark verify
@@ -341,7 +345,7 @@ Prints container metadata: pipeline type, original size, section layout, and per
 - `decode(encode(x))` verified for every dataset in `tests/benchmark.rs`
 - JSON inputs: canonical comparison (all values identical; whitespace and key order normalized)
 - Non-JSON inputs: byte-exact (`decode(encode(x)) == x`)
-- 351 unit tests, 12 integration tests
+- 351 unit tests, 26 integration tests (12 benchmark + 14 roundtrip)
 
 ### CLI Roundtrip Test Results
 
