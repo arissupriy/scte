@@ -18,44 +18,44 @@ SCTE encodes JSON by exploiting its structure rather than treating it as an opaq
 
 ## Measured Results
 
-All figures from `cargo test --release --test benchmark`. `decode(encode(x)) == x` verified for every row. zstd numbers are reference, same machine.
+All figures from `cargo test --release --test benchmark`. `decode(encode(x)) == x` verified for every row via canonical JSON comparison. zstd numbers are reference, same machine.
 
 ```
 Dataset                                    Raw         SCTE    enc MB/s   dec MB/s   zstd-3    zstd-19
 ──────────────────────────────────────────────────────────────────────────────────────────────────────
 Real files — nested JSON (row-major text pipeline)
-  users_100.json                         29929B    3070B  10.3%   24.8 MB/s   77.0 MB/s   16.6%   13.2%
-  users_1k.json                         311042B   18074B   5.8%   25.8 MB/s   85.3 MB/s   14.7%    9.4%
-  users_10k.json                       3084967B  162863B   5.3%   19.5 MB/s   65.0 MB/s   14.4%    8.1%
+  users_100.json                         29929B    3070B  10.3%   15.7 MB/s   66.2 MB/s   16.6%   13.2%
+  users_1k.json                         311042B   18074B   5.8%   11.5 MB/s   56.6 MB/s   14.7%    9.4%
+  users_10k.json                       3084967B  164623B   5.3%   12.7 MB/s   49.5 MB/s   14.4%    8.1%
 
 Real files — flat JSON (columnar pipeline)
-  flat_users_1k.json                     54171B    3126B   5.8%   14.7 MB/s   84.8 MB/s   16.7%   12.8%
-  flat_users_10k.json                   551951B   22714B   4.1%   15.1 MB/s   85.5 MB/s   15.9%   10.1%
-  flat_users_100k.json                 5619926B  218597B   3.9%   15.0 MB/s   81.9 MB/s   15.6%    9.8%
+  flat_users_1k.json                     54171B    3126B   5.8%   20.3 MB/s  113.8 MB/s   16.7%   12.8%
+  flat_users_10k.json                   551951B   23657B   4.3%   20.8 MB/s   94.4 MB/s   15.9%   10.1%
+  flat_users_100k.json                 5619926B  229811B   4.1%   17.8 MB/s  118.5 MB/s   15.6%    9.8%
 
 Entropy ceiling — UUID keys + base64 payloads + random latencies
-  uuid-b64   1000 rows                  109060B   30282B  27.8%   25.9 MB/s   79.2 MB/s   37.9%   36.5%
-  uuid-b64  10000 rows                 1090984B  298567B  27.4%   30.1 MB/s   83.0 MB/s   38.2%   35.9%
+  uuid-b64   1000 rows                  109060B   30282B  27.8%   21.1 MB/s   67.2 MB/s   37.9%   36.5%
+  uuid-b64  10000 rows                 1090984B  298988B  27.4%   19.5 MB/s   57.3 MB/s   38.2%   35.9%
 
 Semi-structured — small-vocab categoricals + random value fields
-  api-semi   1000 rows                  148561B   12131B   8.2%   26.7 MB/s  125.1 MB/s   18.2%   13.4%
-  api-semi   5000 rows                  746507B   57482B   7.7%   22.4 MB/s   97.2 MB/s   18.3%   12.9%
-  api-semi  10000 rows                 1494038B  114214B   7.6%   28.2 MB/s  133.3 MB/s   18.3%   12.7%
+  api-semi   1000 rows                  148561B   11983B   8.1%   17.8 MB/s  117.2 MB/s   18.2%   13.4%
+  api-semi   5000 rows                  746507B   55707B   7.5%   16.3 MB/s   96.7 MB/s   18.3%   12.9%
+  api-semi  10000 rows                 1494038B  111353B   7.5%   15.2 MB/s  100.5 MB/s   18.3%   12.7%
 
 Random flat JSON — no cycling pattern
-  log-json  1000 rows                    99855B    5060B   5.1%   29.7 MB/s  154.5 MB/s   11.4%    7.1%
-  log-json  5000 rows                   503481B   16322B   3.2%   18.9 MB/s  117.8 MB/s   11.3%    6.9%
-  log-json 10000 rows                  1008244B   30380B   3.0%   25.0 MB/s  166.6 MB/s   11.3%    6.8%
+  log-json  1000 rows                    99855B    5060B   5.1%   18.0 MB/s  118.1 MB/s   11.4%    7.1%
+  log-json  5000 rows                   503481B   16322B   3.2%   14.2 MB/s  107.0 MB/s   11.3%    6.9%
+  log-json 10000 rows                  1008244B   32639B   3.2%   16.3 MB/s  107.1 MB/s   11.3%    6.8%
 
 Cycling fields — columnar pipeline, period detector active
-  api-json  1000 rows [periodic]        145641B     862B   0.6%   28.9 MB/s  158.3 MB/s    2.8%    2.2%
-  api-json  5000 rows [periodic]        732641B     862B   0.1%   18.5 MB/s  130.0 MB/s    1.9%    1.5%
-  api-json 10000 rows [periodic]       1466391B     862B   0.1%   17.1 MB/s  131.2 MB/s    1.7%    1.4%
+  api-json  1000 rows [periodic]        145641B     862B   0.6%   16.5 MB/s  116.4 MB/s    2.8%    2.2%
+  api-json  5000 rows [periodic]        732641B     862B   0.1%   15.8 MB/s  127.3 MB/s    1.9%    1.5%
+  api-json 10000 rows [periodic]       1466391B    1855B   0.1%   14.0 MB/s   97.0 MB/s    1.7%    1.4%
 
 All fields independently random per row
-  api-json  1000 rows [random]          146468B    4491B   3.1%   32.8 MB/s  187.2 MB/s    9.8%    7.3%
-  api-json  5000 rows [random]          737129B   18628B   2.5%   31.0 MB/s  185.1 MB/s    9.6%    7.1%
-  api-json 10000 rows [random]         1475245B   36249B   2.5%   30.3 MB/s  180.5 MB/s    9.6%    7.0%
+  api-json  1000 rows [random]          146468B    4491B   3.1%   16.9 MB/s  119.8 MB/s    9.8%    7.3%
+  api-json  5000 rows [random]          737129B   18628B   2.5%   15.0 MB/s  102.2 MB/s    9.6%    7.1%
+  api-json 10000 rows [random]         1475245B   37221B   2.5%   15.9 MB/s  101.4 MB/s    9.6%    7.0%
 ```
 
 Non-JSON passthrough (byte-exact):
@@ -128,12 +128,17 @@ Each column gets an independent encoder selected by size comparison:
 | `TAG_UUID` | 36-char UUID → 16 raw bytes |
 | `TAG_BASE64` | base64 → raw bytes |
 | `TAG_TIMESTAMP` | delta epoch-seconds |
+| `TAG_TIMESTAMP_RANS` | rANS on epoch delta bytes (≥64 rows) |
 | `TAG_FLOAT_FIXED` | scale × 10^d as delta integer |
+| `TAG_FLOAT_FIXED_RANS` | rANS on float delta bytes (≥64 rows) |
 | `TAG_BACKREF` | copy of earlier identical column |
 | `TAG_BOOL` | bit-packed |
 | `TAG_NULL` | empty |
 | `TAG_SUB_TABLE` | recursive columnar block for array-valued fields |
 | `TAG_RAW_STR` | verbatim per-row strings |
+| `TAG_RAW_STR_RANS` | rANS on concatenated string bytes (≥64 rows) |
+
+Arrays exceeding **8 192 rows** are split into independent columnar chunks, each stored as a separate `COLUMNAR` section. The decoder reassembles chunks in row order and stitches the JSON arrays together.
 
 ### Two-Pass Text Pipeline
 
@@ -180,7 +185,7 @@ Container header (24 bytes):
 [22..23] pad
 ```
 
-Section entry (20 bytes each):
+Section entry (20 bytes fixed + optional meta):
 ```
 [0]     type    u8    (0x01=DICT, 0x02=TOKENS, 0x07=PAYLOAD,
                         0x08=SCHEMA, 0x09=COLUMNAR, 0x0A=DELTA, …)
@@ -188,7 +193,9 @@ Section entry (20 bytes each):
 [2..3]  pad
 [4..11] offset  u64
 [12..19] length u64
+[20..27] meta   u64   (COLUMNAR only, multi-chunk: row_start u32 LE | row_end u32 LE)
 ```
+Single-chunk containers omit the meta field; multi-chunk containers include it for every section entry.
 
 ---
 
@@ -228,7 +235,7 @@ scte/
 # Build
 cargo build --release
 
-# Run unit tests (345 tests)
+# Run unit tests (351 tests)
 cargo test --release --lib
 
 # Run integration + benchmark tests (~45 s)
@@ -252,7 +259,7 @@ Requires: **Rust 1.70+** (stable)
 - `decode(encode(x))` verified for every dataset in `tests/benchmark.rs`
 - JSON inputs: canonical comparison (all values identical; whitespace and key order normalized)
 - Non-JSON inputs: byte-exact (`decode(encode(x)) == x`)
-- 345 unit tests, 12 integration tests
+- 351 unit tests, 12 integration tests
 
 ---
 
