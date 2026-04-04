@@ -24,38 +24,38 @@ All figures from `cargo test --release --test benchmark`. `decode(encode(x)) == 
 Dataset                                    Raw         SCTE    enc MB/s   dec MB/s   zstd-3    zstd-19
 ──────────────────────────────────────────────────────────────────────────────────────────────────────
 Real files — nested JSON (row-major text pipeline)
-  users_100.json                         29929B    3070B  10.3%   15.7 MB/s   66.2 MB/s   16.6%   13.2%
-  users_1k.json                         311042B   18074B   5.8%   11.5 MB/s   56.6 MB/s   14.7%    9.4%
-  users_10k.json                       3084967B  164623B   5.3%   12.7 MB/s   49.5 MB/s   14.4%    8.1%
+  users_100.json                         29929B    3070B  10.3%   22.2 MB/s   79.9 MB/s   16.6%   13.2%
+  users_1k.json                         311042B   18074B   5.8%   21.3 MB/s   82.6 MB/s   14.7%    9.4%
+  users_10k.json                       3084967B  164623B   5.3%   17.0 MB/s   75.3 MB/s   14.4%    8.1%
 
 Real files — flat JSON (columnar pipeline)
-  flat_users_1k.json                     54171B    3126B   5.8%   20.3 MB/s  113.8 MB/s   16.7%   12.8%
-  flat_users_10k.json                   551951B   23657B   4.3%   20.8 MB/s   94.4 MB/s   15.9%   10.1%
-  flat_users_100k.json                 5619926B  229811B   4.1%   17.8 MB/s  118.5 MB/s   15.6%    9.8%
+  flat_users_1k.json                     54171B    3126B   5.8%   21.1 MB/s  142.5 MB/s   16.7%   12.8%
+  flat_users_10k.json                   551951B   23657B   4.3%   25.1 MB/s  144.8 MB/s   15.9%   10.1%
+  flat_users_100k.json                 5619926B  229811B   4.1%   23.7 MB/s  133.7 MB/s   15.6%    9.8%
 
 Entropy ceiling — UUID keys + base64 payloads + random latencies
-  uuid-b64   1000 rows                  109060B   30282B  27.8%   21.1 MB/s   67.2 MB/s   37.9%   36.5%
-  uuid-b64  10000 rows                 1090984B  298988B  27.4%   19.5 MB/s   57.3 MB/s   38.2%   35.9%
+  uuid-b64   1000 rows                  109060B   30282B  27.8%   29.3 MB/s  102.8 MB/s   37.9%   36.5%
+  uuid-b64  10000 rows                 1090984B  298988B  27.4%   34.9 MB/s   96.8 MB/s   38.2%   35.9%
 
 Semi-structured — small-vocab categoricals + random value fields
-  api-semi   1000 rows                  148561B   11983B   8.1%   17.8 MB/s  117.2 MB/s   18.2%   13.4%
-  api-semi   5000 rows                  746507B   55707B   7.5%   16.3 MB/s   96.7 MB/s   18.3%   12.9%
-  api-semi  10000 rows                 1494038B  111353B   7.5%   15.2 MB/s  100.5 MB/s   18.3%   12.7%
+  api-semi   1000 rows                  148561B   11983B   8.1%   32.0 MB/s  154.2 MB/s   18.2%   13.4%
+  api-semi   5000 rows                  746507B   55707B   7.5%   30.7 MB/s  156.4 MB/s   18.3%   12.9%
+  api-semi  10000 rows                 1494038B  111353B   7.5%   28.8 MB/s  163.3 MB/s   18.3%   12.7%
 
 Random flat JSON — no cycling pattern
-  log-json  1000 rows                    99855B    5060B   5.1%   18.0 MB/s  118.1 MB/s   11.4%    7.1%
-  log-json  5000 rows                   503481B   16322B   3.2%   14.2 MB/s  107.0 MB/s   11.3%    6.9%
-  log-json 10000 rows                  1008244B   32639B   3.2%   16.3 MB/s  107.1 MB/s   11.3%    6.8%
+  log-json  1000 rows                    99855B    5060B   5.1%   30.4 MB/s  166.2 MB/s   11.4%    7.1%
+  log-json  5000 rows                   503481B   16322B   3.2%   30.3 MB/s  162.7 MB/s   11.3%    6.9%
+  log-json 10000 rows                  1008244B   32639B   3.2%   29.2 MB/s  168.8 MB/s   11.3%    6.8%
 
 Cycling fields — columnar pipeline, period detector active
-  api-json  1000 rows [periodic]        145641B     862B   0.6%   16.5 MB/s  116.4 MB/s    2.8%    2.2%
-  api-json  5000 rows [periodic]        732641B     862B   0.1%   15.8 MB/s  127.3 MB/s    1.9%    1.5%
-  api-json 10000 rows [periodic]       1466391B    1855B   0.1%   14.0 MB/s   97.0 MB/s    1.7%    1.4%
+  api-json  1000 rows [periodic]        145641B     862B   0.6%   31.4 MB/s  192.1 MB/s    2.8%    2.2%
+  api-json  5000 rows [periodic]        732641B     862B   0.1%   28.0 MB/s  194.7 MB/s    1.9%    1.5%
+  api-json 10000 rows [periodic]       1466391B    1855B   0.1%   27.5 MB/s  184.7 MB/s    1.7%    1.4%
 
 All fields independently random per row
-  api-json  1000 rows [random]          146468B    4491B   3.1%   16.9 MB/s  119.8 MB/s    9.8%    7.3%
-  api-json  5000 rows [random]          737129B   18628B   2.5%   15.0 MB/s  102.2 MB/s    9.6%    7.1%
-  api-json 10000 rows [random]         1475245B   37221B   2.5%   15.9 MB/s  101.4 MB/s    9.6%    7.0%
+  api-json  1000 rows [random]          146468B    4491B   3.1%   28.3 MB/s  160.1 MB/s    9.8%    7.3%
+  api-json  5000 rows [random]          737129B   18628B   2.5%   26.9 MB/s  166.0 MB/s    9.6%    7.1%
+  api-json 10000 rows [random]         1475245B   37221B   2.5%   26.8 MB/s  161.2 MB/s    9.6%    7.0%
 ```
 
 Non-JSON passthrough (byte-exact):
