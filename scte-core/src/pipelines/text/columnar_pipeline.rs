@@ -223,6 +223,23 @@ const TAG_TIMESTAMP_RANS: u8 = 0x18;
 ///   rans_bytes         rans_len bytes
 const TAG_RAW_STR_RANS: u8 = 0x19;
 
+// ── "Reference" tags — valid only when a GlobalCols section is present ────────
+//
+// These tags appear inside COLUMNAR chunk sections when the container also
+// carries a SectionType::GlobalCols section.  They skip the embedded variant
+// table / FreqTable because those are stored once in GlobalCols, saving
+// redundant bytes across every chunk.
+
+/// Enum column with shared global variant table.  Sub-tag byte (see below)
+/// selects the index-stream encoding without a per-chunk variant table.
+///
+/// Sub-tag 0 (delta):   `data_len varint` + delta-encoded variant indices
+/// Sub-tag 1 (period):  `base_len varint` + delta-encoded base indices
+/// Sub-tag 2 (rans):    `rans_len varint` + rANS bytes  (uses global FreqTable;
+///                       only valid when GlobalCols stores `EnumRans` for this column)
+/// Sub-tag 3 (rle):     `rle_count varint` + (idx `u8` + run_len varint) × rle_count
+const TAG_ENUM_REF: u8 = 0x25;
+
 /// Number of rows per columnar SCTE section when chunking large arrays.
 ///
 /// Arrays with more than this many rows are split into multiple SCTE sections.
@@ -249,6 +266,43 @@ enum RawValue {
 struct RawColumn {
     key_path: String,
     values: Vec<RawValue>,
+}
+
+// ── Global column state (cross-chunk sharing) ────────────────────────────────
+
+/// Per-column global state computed from **all rows** of a multi-chunk array.
+///
+/// Stored in a [`SectionType::GlobalCols`] section so that individual
+/// [`SectionType::Columnar`] chunks can omit the variant table / FreqTable that
+/// they would otherwise repeat in every chunk.
+#[derive(Debug, Clone)]
+pub(crate) enum GlobalColKind {
+    /// No global optimisation for this column (period/delta/passthrough).
+    /// Chunk sections use their regular per-column tags unchanged.
+    None,
+    /// Enum column — global variant list.  Chunk sections use [`TAG_ENUM_REF`].
+    Enum { variants: Vec<String> },
+    /// Enum column — global variant list **and** global rANS FreqTable.
+    /// Chunk sections use [`TAG_ENUM_REF`] with sub-tag 2.
+    EnumRans { variants: Vec<String>, freq: crate::entropy::FreqTable },
+}
+
+/// Map of column path → [`GlobalColKind`] shared across all chunks.
+pub(crate) struct GlobalColsContext {
+    cols: Vec<(String, GlobalColKind)>,
+}
+
+impl GlobalColsContext {
+    pub(crate) fn new() -> Self { Self { cols: Vec::new() } }
+
+    pub(crate) fn push(&mut self, path: String, kind: GlobalColKind) {
+        self.cols.push((path, kind));
+    }
+
+    /// Lookup global state for a column by its dotted path.
+    pub(crate) fn get(&self, path: &str) -> Option<&GlobalColKind> {
+        self.cols.iter().find(|(p, _)| p == path).map(|(_, k)| k)
+    }
 }
 
 /// A field value in an object that lives inside an array (array item).
@@ -326,7 +380,7 @@ pub fn encode_columnar(input: &[u8]) -> Result<Vec<u8>, ScteError> {
 /// [`try_encode_columnar_chunks_from_tokens`] instead (returns multiple chunks
 /// for multi-section container assembly).
 pub(crate) fn try_encode_columnar_from_tokens(tokens: &[Token]) -> Option<Vec<u8>> {
-    let chunks = try_encode_columnar_chunks_from_tokens(tokens)?;
+    let (_, chunks) = try_encode_columnar_chunks_from_tokens(tokens)?;
     if chunks.len() == 1 {
         Some(chunks.into_iter().next().unwrap().2)
     } else {
@@ -347,7 +401,7 @@ pub(crate) fn try_encode_columnar_from_tokens(tokens: &[Token]) -> Option<Vec<u8
 /// Returns `None` if the input is not a homogeneous `Array<Object>`.
 pub(crate) fn try_encode_columnar_chunks_from_tokens(
     tokens: &[Token],
-) -> Option<Vec<(u32, u32, Vec<u8>)>> {
+) -> Option<(Option<Vec<u8>>, Vec<(u32, u32, Vec<u8>)>)> {
     let extract   = extract_all_columns(tokens)?;
     let row_count = extract.row_count;
 
@@ -355,20 +409,45 @@ pub(crate) fn try_encode_columnar_chunks_from_tokens(
         let bytes = encode_extract_range(
             &extract.scalar_cols, &extract.sub_tables, 0, row_count,
         );
-        return Some(vec![(0u32, row_count as u32, bytes)]);
+        return Some((None, vec![(0u32, row_count as u32, bytes)]));
     }
+
+    // Multi-chunk: build global context from all rows to share variant tables
+    // and FreqTables across chunks (avoids repeating ~100–400 bytes per enum
+    // column per chunk).
+    //
+    // Only worth it for ≥ 3 chunks: for 2-chunk files the GlobalCols section
+    // overhead can exceed the per-chunk savings, especially when the period
+    // detector would otherwise compress cycling columns near-perfectly.
+    let num_chunks = (row_count + COLUMNAR_CHUNK_ROWS - 1) / COLUMNAR_CHUNK_ROWS;
+    let global_ctx  = if num_chunks >= 3 {
+        build_global_context(&extract.scalar_cols)
+    } else {
+        GlobalColsContext { cols: Vec::new() }
+    };
+    let global_bytes = if global_ctx.cols.iter().any(|(_, k)| !matches!(k, GlobalColKind::None)) {
+        Some(encode_global_cols_section(&global_ctx))
+    } else {
+        None
+    };
 
     let mut chunks = Vec::new();
     let mut start  = 0;
     while start < row_count {
         let end   = (start + COLUMNAR_CHUNK_ROWS).min(row_count);
-        let bytes = encode_extract_range(
-            &extract.scalar_cols, &extract.sub_tables, start, end,
-        );
+        let bytes = if global_bytes.is_some() {
+            encode_extract_range_with_global(
+                &extract.scalar_cols, &extract.sub_tables, start, end, &global_ctx,
+            )
+        } else {
+            encode_extract_range(
+                &extract.scalar_cols, &extract.sub_tables, start, end,
+            )
+        };
         chunks.push((start as u32, end as u32, bytes));
         start = end;
     }
-    Some(chunks)
+    Some((global_bytes, chunks))
 }
 
 fn encode_columnar_from_tokens(tokens: &[Token]) -> Result<Vec<u8>, ScteError> {
@@ -2451,6 +2530,606 @@ mod indexmap {
     }
 }
 
+// ── Global column state: computation ──────────────────────────────────────────
+
+/// Compute the [`GlobalColKind`] for a column using **all rows** from
+/// the full dataset (concatenation of all chunks).
+///
+/// The returned kind is used when encoding subsequent individual chunks so
+/// they can skip embedding the per-column variant table / FreqTable.
+pub(crate) fn compute_global_col_kind(col: &RawColumn) -> GlobalColKind {
+    let values = &col.values;
+    if values.is_empty() { return GlobalColKind::None; }
+    if !values.iter().all(|v| matches!(v, RawValue::Str(_))) {
+        return GlobalColKind::None;
+    }
+    let strs: Vec<&str> = values.iter().map(|v| match v {
+        RawValue::Str(s) => s.as_str(), _ => "",
+    }).collect();
+
+    // Cardinality pre-screen — only enum-range columns benefit from sharing.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(32);
+    let mut high = false;
+    for &s in &strs { seen.insert(s); if seen.len() > 256 { high = true; break; } }
+    if high { return GlobalColKind::None; }
+
+    // Build variant list in first-seen order (same as encode_enum_column).
+    let mut variants: Vec<&str> = Vec::with_capacity(seen.len().min(256));
+    let mut index_map: std::collections::HashMap<&str, u8> =
+        std::collections::HashMap::with_capacity(seen.len().min(256));
+    for &s in &strs {
+        if !index_map.contains_key(s) && variants.len() < 256 {
+            index_map.insert(s, variants.len() as u8);
+            variants.push(s);
+        }
+    }
+    let indices: Vec<u8> = strs.iter().map(|s| index_map[s]).collect();
+    let variants_owned: Vec<String> = variants.iter().map(|s| s.to_string()).collect();
+
+    // Try rANS on all indices to decide whether to store a global FreqTable.
+    if strs.len() >= 64 {
+        let m_bits: u32 = match variants.len() {
+            0..=4   => 8,
+            5..=16  => 10,
+            17..=64 => 12,
+            _       => 14,
+        };
+        let freq = FreqTable::build(&indices, variants.len().max(1), m_bits);
+        let ft_bytes = freq.serialize();
+        let varint_len = |mut n: usize| -> usize {
+            let mut l = 1usize; while n >= 0x80 { n >>= 7; l += 1; } l
+        };
+        // Compare two global options: Enum vs EnumRans.
+        // We only store EnumRans when globally the rANS model is clearly useful,
+        // so that REF chunks can safely use rans sub-tag.
+        // Size heuristic: if FreqTable adds < 20% overhead per entry, prefer EnumRans.
+        let ft_cost_per_chunk = ft_bytes.len();
+        if ft_cost_per_chunk > 0 {
+            // Use EnumRans when the FreqTable is non-trivially large (>4 distinct symbols)
+            // — the savings from skipping ft_bytes in each chunk outweigh adding it to GlobalCols.
+            let _ = varint_len; // suppress unused
+            if variants.len() > 4 {
+                if let Ok(_rans_bytes) = rans_encode(&indices, &freq) {
+                    return GlobalColKind::EnumRans { variants: variants_owned, freq };
+                }
+            }
+        }
+    }
+    GlobalColKind::Enum { variants: variants_owned }
+}
+
+/// Build a [`GlobalColsContext`] from the full (non-chunked) scalar column list.
+pub(crate) fn build_global_context(scalar_cols: &[RawColumn]) -> GlobalColsContext {
+    let mut ctx = GlobalColsContext::new();
+    for col in scalar_cols {
+        let kind = compute_global_col_kind(col);
+        if !matches!(kind, GlobalColKind::None) {
+            ctx.push(col.key_path.clone(), kind);
+        }
+    }
+    ctx
+}
+
+// ── Global column state: serialization ────────────────────────────────────────
+
+/// Serialize a [`GlobalColsContext`] into the payload bytes of a
+/// `SectionType::GlobalCols` section.
+///
+/// Wire format:
+/// ```text
+/// u8      version = 1
+/// varint  n_cols
+/// for each column:
+///   varint  path_len
+///   bytes   path
+///   u8      kind_tag  (0 = Enum, 1 = EnumRans)
+///   [Enum]    n_variants varint + [var_len varint + var_bytes] × n_variants
+///   [EnumRans] same as Enum, then ft_len varint + ft_bytes
+/// ```
+pub(crate) fn encode_global_cols_section(ctx: &GlobalColsContext) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(1u8); // version
+    let usable: Vec<&(String, GlobalColKind)> = ctx.cols.iter()
+        .filter(|(_, k)| !matches!(k, GlobalColKind::None))
+        .collect();
+    varint::encode_usize(usable.len(), &mut out);
+    for (path, kind) in &usable {
+        varint::encode_usize(path.len(), &mut out);
+        out.extend_from_slice(path.as_bytes());
+        match kind {
+            GlobalColKind::None => {}
+            GlobalColKind::Enum { variants } => {
+                out.push(0u8); // kind_tag
+                encode_variant_table_bytes(variants, &mut out);
+            }
+            GlobalColKind::EnumRans { variants, freq } => {
+                out.push(1u8); // kind_tag
+                encode_variant_table_bytes(variants, &mut out);
+                let ft_bytes = freq.serialize();
+                varint::encode_usize(ft_bytes.len(), &mut out);
+                out.extend_from_slice(&ft_bytes);
+            }
+        }
+    }
+    out
+}
+
+fn encode_variant_table_bytes(variants: &[String], out: &mut Vec<u8>) {
+    varint::encode_usize(variants.len(), out);
+    for v in variants {
+        varint::encode_usize(v.len(), out);
+        out.extend_from_slice(v.as_bytes());
+    }
+}
+
+/// Deserialize a `GlobalCols` section payload back to a [`GlobalColsContext`].
+pub(crate) fn decode_global_cols_section(data: &[u8]) -> Result<GlobalColsContext, ScteError> {
+    if data.is_empty() {
+        return Err(ScteError::DecodeError("global_cols: empty payload".into()));
+    }
+    let version = data[0];
+    if version != 1 {
+        return Err(ScteError::DecodeError(
+            format!("global_cols: unknown version {version}"),
+        ));
+    }
+    let mut pos = 1usize;
+    let rd = |data: &[u8], pos: &mut usize| -> Result<usize, ScteError> {
+        let (v, n) = varint::decode_usize(data, *pos)
+            .ok_or_else(|| ScteError::DecodeError("global_cols: bad varint".into()))?;
+        *pos += n;
+        Ok(v)
+    };
+    let col_count = rd(data, &mut pos)?;
+    let mut ctx = GlobalColsContext::new();
+    for _ in 0..col_count {
+        let path_len = rd(data, &mut pos)?;
+        let path_end = pos + path_len;
+        if path_end > data.len() {
+            return Err(ScteError::DecodeError("global_cols: truncated path".into()));
+        }
+        let path = std::str::from_utf8(&data[pos..path_end])
+            .map_err(|_| ScteError::DecodeError("global_cols: non-utf8 path".into()))?
+            .to_owned();
+        pos = path_end;
+
+        let kind_tag = *data.get(pos)
+            .ok_or_else(|| ScteError::DecodeError("global_cols: missing kind_tag".into()))?;
+        pos += 1;
+
+        let variants = {
+            let n = rd(data, &mut pos)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let slen = rd(data, &mut pos)?;
+                let end = pos + slen;
+                if end > data.len() {
+                    return Err(ScteError::DecodeError("global_cols: truncated variant".into()));
+                }
+                let s = std::str::from_utf8(&data[pos..end])
+                    .map_err(|_| ScteError::DecodeError("global_cols: non-utf8 variant".into()))?
+                    .to_owned();
+                pos = end;
+                v.push(s);
+            }
+            v
+        };
+
+        let kind = match kind_tag {
+            0 => GlobalColKind::Enum { variants },
+            1 => {
+                let ft_len = rd(data, &mut pos)?;
+                let ft_end = pos + ft_len;
+                if ft_end > data.len() {
+                    return Err(ScteError::DecodeError("global_cols: truncated FreqTable".into()));
+                }
+                let (freq, _) = FreqTable::deserialize(&data[pos..ft_end], 0)
+                    .map_err(|e| ScteError::DecodeError(format!("global_cols: bad FreqTable: {e}")))?;
+                pos = ft_end;
+                GlobalColKind::EnumRans { variants, freq }
+            }
+            other => {
+                return Err(ScteError::DecodeError(
+                    format!("global_cols: unknown kind_tag {other:#04x}"),
+                ));
+            }
+        };
+        ctx.push(path, kind);
+    }
+    Ok(ctx)
+}
+
+// ── Global-aware column encoding ──────────────────────────────────────────────
+
+/// Encode an enum column using the **global** variant list (and optionally the
+/// global rANS FreqTable), emitting [`TAG_ENUM_REF`] instead of `TAG_ENUM` or
+/// `TAG_ENUM_RANS`.
+///
+/// This saves the repeated variant table (often 100–400 bytes per chunk) at
+/// the cost of one extra byte (the sub-tag).
+fn encode_enum_column_with_global(
+    strs:    &[&str],
+    global:  &GlobalColKind,       // Enum or EnumRans
+    out:     &mut Vec<u8>,
+) {
+    let (global_variants, global_freq) = match global {
+        GlobalColKind::Enum    { variants }       => (variants, None),
+        GlobalColKind::EnumRans{ variants, freq } => (variants, Some(freq)),
+        GlobalColKind::None => { encode_enum_column(strs, out); return; }
+    };
+
+    // Map every value to its index in the global variant list.
+    let mut index_map: std::collections::HashMap<&str, u8> =
+        std::collections::HashMap::with_capacity(global_variants.len());
+    for (i, v) in global_variants.iter().enumerate() {
+        if i < 256 { index_map.insert(v.as_str(), i as u8); }
+    }
+    let indices: Vec<u8> = strs.iter().map(|s| {
+        index_map.get(s).copied().unwrap_or(0) // unknown values map to 0 (safe fallback)
+    }).collect();
+
+    let indices_i64: Vec<i64> = indices.iter().map(|&i| i as i64).collect();
+    let varint_len = |mut n: usize| -> usize {
+        let mut l = 1usize; while n >= 0x80 { n >>= 7; l += 1; } l
+    };
+
+    // ── Try rANS with global FreqTable ────────────────────────────────────────
+    if let Some(freq) = global_freq {
+        if strs.len() >= 64 {
+            if let Ok(rans_bytes) = rans_encode(&indices, freq) {
+                // sub-tag 2 = rans; no variant table, no FreqTable
+                out.push(TAG_ENUM_REF);
+                out.push(2u8);  // sub-tag: rans
+                varint::encode_usize(rans_bytes.len(), out);
+                out.extend_from_slice(&rans_bytes);
+                return;
+            }
+        }
+    }
+
+    // ── Try period ────────────────────────────────────────────────────────────
+    if let Some(base) = detect_period_i64(&indices_i64) {
+        let base_enc = encode_delta_ints(&base);
+        out.push(TAG_ENUM_REF);
+        out.push(1u8);  // sub-tag: period
+        varint::encode_usize(base_enc.len(), out);
+        out.extend_from_slice(&base_enc);
+        return;
+    }
+
+    // ── Try RLE ───────────────────────────────────────────────────────────────
+    {
+        let mut runs: Vec<(u8, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < indices.len() {
+            let sym = indices[i];
+            let mut run = 1usize;
+            while i + run < indices.len() && indices[i + run] == sym { run += 1; }
+            runs.push((sym, run));
+            i += run;
+        }
+        let rle_size: usize = runs.iter().map(|(_, r)| 1 + varint_len(*r)).sum();
+        let delta_body = encode_delta_ints(&indices_i64);
+        // REF versions have no variant table, so direct comparison:
+        // ref_rle_size = 1 (tag) + 1 (sub-tag) + varint(run_count) + rle_size
+        // ref_delta_size = 1 (tag) + 1 (sub-tag) + varint(data_len) + delta_body.len()
+        let rle_total   = 2 + varint_len(runs.len()) + rle_size;
+        let delta_total = 2 + varint_len(delta_body.len()) + delta_body.len();
+        if rle_total < delta_total {
+            out.push(TAG_ENUM_REF);
+            out.push(3u8);  // sub-tag: rle
+            varint::encode_usize(runs.len(), out);
+            for (sym, run) in &runs {
+                out.push(*sym);
+                varint::encode_usize(*run, out);
+            }
+            return;
+        }
+    }
+
+    // ── Delta fallback ────────────────────────────────────────────────────────
+    let delta_body = encode_delta_ints(&indices_i64);
+    out.push(TAG_ENUM_REF);
+    out.push(0u8);  // sub-tag: delta
+    varint::encode_usize(delta_body.len(), out);
+    out.extend_from_slice(&delta_body);
+}
+
+/// Encode a single column, using the global context when available.
+/// Falls back to the regular local [`encode_one_column`] when no global
+/// state is registered for this column.
+fn encode_one_column_with_global(
+    col:        &RawColumn,
+    idx:        usize,
+    all_cols:   &[RawColumn],
+    row_count:  usize,
+    global_ctx: &GlobalColsContext,
+    out:        &mut Vec<u8>,
+) {
+    // Write path (same as regular encoding).
+    let path_bytes = col.key_path.as_bytes();
+    varint::encode_usize(path_bytes.len(), out);
+    out.extend_from_slice(path_bytes);
+
+    let prior_cols = &all_cols[..idx];
+
+    // BackRef check — still worth doing across chunks (column layout is stable).
+    if idx > 0 {
+        if let Some(src) = detect_backref(col, prior_cols) {
+            out.push(TAG_BACKREF);
+            varint::encode_usize(src, out);
+            return;
+        }
+    }
+
+    // Use global kind when available for string enum columns.
+    // Compare against regular encoding and keep the smaller result to avoid
+    // regressing on columns the period-detector compresses more tightly.
+    if let Some(kind) = global_ctx.get(&col.key_path) {
+        if matches!(kind, GlobalColKind::Enum { .. } | GlobalColKind::EnumRans { .. }) {
+            // Column must be all-string with low cardinality — verify silently.
+            if col.values.iter().all(|v| matches!(v, RawValue::Str(_))) {
+                let strs: Vec<&str> = col.values.iter().map(|v| match v {
+                    RawValue::Str(s) => s.as_str(), _ => "",
+                }).collect();
+                let mut global_out = Vec::new();
+                encode_enum_column_with_global(&strs, kind, &mut global_out);
+
+                // Compare size with the regular (period/delta) encoding.
+                let mut regular_out = Vec::new();
+                encode_by_type(col, row_count, &mut regular_out);
+
+                if global_out.len() <= regular_out.len() {
+                    out.extend_from_slice(&global_out);
+                } else {
+                    out.extend_from_slice(&regular_out);
+                }
+                return;
+            }
+        }
+    }
+
+    // Fall back to regular local encoding.
+    encode_by_type(col, row_count, out);
+}
+
+/// Variant of [`encode_extract_range`] that uses a [`GlobalColsContext`] for
+/// all scalar columns where global state is available.
+pub(crate) fn encode_extract_range_with_global(
+    scalar_cols: &[RawColumn],
+    sub_tables:  &[SubTable],
+    row_start:   usize,
+    row_end:     usize,
+    global_ctx:  &GlobalColsContext,
+) -> Vec<u8> {
+    let row_count = row_end - row_start;
+    let col_count = scalar_cols.len() + sub_tables.len();
+    let mut out   = Vec::new();
+    out.push(COLUMNAR_VERSION);
+    varint::encode_usize(row_count, &mut out);
+    varint::encode_usize(col_count, &mut out);
+
+    let sliced: Vec<RawColumn> = scalar_cols.iter().map(|col| RawColumn {
+        key_path: col.key_path.clone(),
+        values:   col.values[row_start..row_end].to_vec(),
+    }).collect();
+    for (idx, col) in sliced.iter().enumerate() {
+        encode_one_column_with_global(col, idx, &sliced, row_count, global_ctx, &mut out);
+    }
+    for sub in sub_tables {
+        encode_sub_table_range(sub, row_start, row_end, &mut out);
+    }
+    out
+}
+
+// ── Global-aware column decoding ──────────────────────────────────────────────
+
+/// Decode a COLUMNAR section produced with a [`GlobalColsContext`] present.
+///
+/// When `global_ctx` is `Some`, the decoder can handle [`TAG_ENUM_REF`] tags
+/// by looking up variant tables / FreqTables from the context.
+/// When `None`, this is equivalent to the normal [`decode_columnar`] path and
+/// no REF tags are expected.
+pub(crate) fn decode_columnar_with_context(
+    section_data: &[u8],
+    global_ctx:   Option<&GlobalColsContext>,
+) -> Result<Vec<u8>, ScteError> {
+    let mut pos = 0usize;
+
+    let version = *section_data.get(pos)
+        .ok_or_else(|| ScteError::DecodeError("columnar: truncated header".into()))?;
+    pos += 1;
+    if version != COLUMNAR_VERSION {
+        return Err(ScteError::DecodeError(
+            format!("columnar: unknown version {version}"),
+        ));
+    }
+    let (row_count, n) = varint::decode_usize(section_data, pos)
+        .ok_or_else(|| ScteError::DecodeError("columnar: bad row_count".into()))?;
+    pos += n;
+    let (col_count, n) = varint::decode_usize(section_data, pos)
+        .ok_or_else(|| ScteError::DecodeError("columnar: bad col_count".into()))?;
+    pos += n;
+
+    let mut decoded_cols: Vec<(String, Vec<String>)> = Vec::with_capacity(col_count);
+    for _col_idx in 0..col_count {
+        let (path, values) =
+            decode_one_column_with_context(section_data, &mut pos, row_count,
+                                            &decoded_cols, global_ctx)?;
+        decoded_cols.push((path, values));
+    }
+    Ok(reconstruct_json(&decoded_cols, row_count))
+}
+
+/// Inner column decoder that supports both regular and `_REF` tags.
+fn decode_one_column_with_context(
+    data:        &[u8],
+    pos:         &mut usize,
+    row_count:   usize,
+    decoded_cols: &[(String, Vec<String>)],
+    global_ctx:  Option<&GlobalColsContext>,
+) -> Result<(String, Vec<String>), ScteError> {
+    macro_rules! rd_varint {
+        () => {{
+            let (v, n) = varint::decode_usize(data, *pos)
+                .ok_or_else(|| ScteError::DecodeError("columnar: bad varint".into()))?;
+            *pos += n;
+            v
+        }};
+    }
+    macro_rules! rd_bytes {
+        ($len:expr) => {{
+            let end = *pos + $len;
+            if end > data.len() {
+                return Err(ScteError::DecodeError("columnar: unexpected eof".into()));
+            }
+            let slice = &data[*pos..end];
+            *pos = end;
+            slice
+        }};
+    }
+
+    // Path
+    let path_len   = rd_varint!();
+    let path_bytes = rd_bytes!(path_len);
+    let path = std::str::from_utf8(path_bytes)
+        .map_err(|_| ScteError::DecodeError("columnar: invalid utf8 path".into()))?
+        .to_owned();
+
+    let tag = *data.get(*pos)
+        .ok_or_else(|| ScteError::DecodeError("columnar: missing tag".into()))?;
+    *pos += 1;
+
+    // ── TAG_ENUM_REF: uses global variant table ───────────────────────────────
+    if tag == TAG_ENUM_REF {
+        let sub_tag = *data.get(*pos)
+            .ok_or_else(|| ScteError::DecodeError("columnar: TAG_ENUM_REF missing sub_tag".into()))?;
+        *pos += 1;
+
+        let variants = global_ctx
+            .and_then(|ctx| ctx.get(&path))
+            .map(|kind| match kind {
+                GlobalColKind::Enum    { variants }    => variants.clone(),
+                GlobalColKind::EnumRans{ variants, .. } => variants.clone(),
+                GlobalColKind::None => Vec::new(),
+            })
+            .ok_or_else(|| ScteError::DecodeError(
+                format!("columnar: TAG_ENUM_REF but no global context for '{path}'"),
+            ))?;
+
+        let values: Vec<String> = match sub_tag {
+            0 => {
+                // delta
+                let data_len = rd_varint!();
+                let body = rd_bytes!(data_len);
+                let indices = decode_delta_ints(body)
+                    .ok_or_else(|| ScteError::DecodeError("columnar: TAG_ENUM_REF delta bad".into()))?;
+                if indices.len() != row_count {
+                    return Err(ScteError::DecodeError("columnar: TAG_ENUM_REF delta len mismatch".into()));
+                }
+                indices.into_iter().map(|idx| {
+                    let s = variants.get(idx as usize).cloned()
+                        .unwrap_or_else(|| format!("?{idx}"));
+                    json_quote(&s)
+                }).collect()
+            }
+            1 => {
+                // period
+                let base_len = rd_varint!();
+                let base_body = rd_bytes!(base_len);
+                let base_indices = decode_delta_ints(base_body)
+                    .ok_or_else(|| ScteError::DecodeError("columnar: TAG_ENUM_REF period bad".into()))?;
+                if base_indices.is_empty() {
+                    return Err(ScteError::DecodeError("columnar: TAG_ENUM_REF period empty base".into()));
+                }
+                let p = base_indices.len();
+                (0..row_count).map(|i| {
+                    let idx = base_indices[i % p] as usize;
+                    let s = variants.get(idx).cloned().unwrap_or_else(|| format!("?{idx}"));
+                    json_quote(&s)
+                }).collect()
+            }
+            2 => {
+                // rans — FreqTable comes from global context
+                let freq = global_ctx
+                    .and_then(|ctx| ctx.get(&path))
+                    .and_then(|kind| match kind {
+                        GlobalColKind::EnumRans { freq, .. } => Some(freq),
+                        _ => None,
+                    })
+                    .ok_or_else(|| ScteError::DecodeError(
+                        format!("columnar: TAG_ENUM_REF sub-tag 2 but no EnumRans for '{path}'"),
+                    ))?;
+                let rans_len   = rd_varint!();
+                let rans_bytes = rd_bytes!(rans_len);
+                let (idx_bytes, _) = rans_decode(rans_bytes, freq, row_count, 0)
+                    .map_err(|e| ScteError::DecodeError(
+                        format!("columnar: TAG_ENUM_REF rans decode: {e}"),
+                    ))?;
+                if idx_bytes.len() != row_count {
+                    return Err(ScteError::DecodeError("columnar: TAG_ENUM_REF rans len mismatch".into()));
+                }
+                idx_bytes.into_iter().map(|idx| {
+                    let s = variants.get(idx as usize).cloned()
+                        .unwrap_or_else(|| format!("?{idx}"));
+                    json_quote(&s)
+                }).collect()
+            }
+            3 => {
+                // rle
+                let run_count = rd_varint!();
+                let mut result = Vec::with_capacity(row_count);
+                for _ in 0..run_count {
+                    let idx = *data.get(*pos)
+                        .ok_or_else(|| ScteError::DecodeError("columnar: TAG_ENUM_REF rle idx".into()))?;
+                    *pos += 1;
+                    let run_len = rd_varint!();
+                    let s = variants.get(idx as usize).cloned()
+                        .unwrap_or_else(|| format!("?{idx}"));
+                    let quoted = json_quote(&s);
+                    for _ in 0..run_len { result.push(quoted.clone()); }
+                }
+                if result.len() != row_count {
+                    return Err(ScteError::DecodeError("columnar: TAG_ENUM_REF rle len mismatch".into()));
+                }
+                result
+            }
+            other => {
+                return Err(ScteError::DecodeError(
+                    format!("columnar: TAG_ENUM_REF unknown sub-tag {other:#04x}"),
+                ));
+            }
+        };
+        return Ok((path, values));
+    }
+
+    // All other tags: delegate to the original decode_one_column.
+    // We re-wind pos by (tag byte) since decode_one_column reads it too.
+    // Instead, reconstruct: we already consumed path and tag; pass a synthetic
+    // slice starting at the current pos (after tag) with the tag byte prepended.
+    // Actually, decode_one_column takes the full section data; let's reconstruct
+    // the call by adjusting pos.  The easiest approach: re-invoke through a
+    // forged slice where we put the tag back.
+    //
+    // Simpler: just inline the same path from decode_one_column for non-REF tags.
+    // Since that code already exists as decode_one_column (which reads path+tag
+    // itself), and we've already consumed both here, we need to handle the
+    // remaining tags ourselves.  To avoid massive duplication, we unseat the
+    // path and re-call decode_one_column by moving pos back to before the tag.
+    *pos -= 1; // un-consume the tag
+
+    // Also un-consume the path: we need to move pos back path_len + varlen(path_len).
+    let path_varint_len = {
+        let mut n = path_len;
+        let mut l = 1usize;
+        while n >= 0x80 { n >>= 7; l += 1; }
+        l
+    };
+    *pos -= path_varint_len + path_len;
+
+    decode_one_column(data, pos, row_count, decoded_cols)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2824,7 +3503,7 @@ mod tests {
             .pipe_wrapped_in_array();
 
         // Encoding must produce multiple sections.
-        let chunks = try_encode_columnar_chunks_from_tokens(
+        let (_, chunks) = try_encode_columnar_chunks_from_tokens(
             &crate::pipelines::text::tokenizer::tokenize_json(&json).unwrap(),
         ).expect("chunked encode failed");
         assert!(chunks.len() >= 2, "expected ≥2 chunks for {} rows, got {}", n, chunks.len());

@@ -128,6 +128,7 @@ fn cmd_inspect(args: &[String]) {
                     SectionType::Meta       => "Meta     ",
                     SectionType::Schema     => "Schema   ",
                     SectionType::Columnar   => "Columnar ",
+                    SectionType::GlobalCols => "GlobCols ",
                     SectionType::Unknown(v) => {
                         type_name_buf = format!("0x{v:02x}    ");
                         &type_name_buf

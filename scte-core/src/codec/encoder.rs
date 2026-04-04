@@ -147,8 +147,8 @@ fn encode_json(input: &[u8]) -> Result<Vec<u8>, ScteError> {
     // Try columnar path first (Array<Object> with uniform schema).
     // Returns one or more chunks; large arrays (≥ COLUMNAR_CHUNK_ROWS) are split
     // into separate sections for parallel decode and partial access.
-    if let Some(chunks) = try_encode_columnar_chunks_from_tokens(&tokens) {
-        return assemble_columnar_container(input.len(), &chunks);
+    if let Some((global_bytes, chunks)) = try_encode_columnar_chunks_from_tokens(&tokens) {
+        return assemble_columnar_container(input.len(), global_bytes.as_deref(), &chunks);
     }
 
     // Fall back to row-major two-pass pipeline using the pre-parsed tokens.
@@ -166,19 +166,27 @@ fn encode_json(input: &[u8]) -> Result<Vec<u8>, ScteError> {
 /// carries an 8-byte meta field `[row_start: u32 LE][row_end: u32 LE]` that
 /// enables parallel decode and partial data access.
 pub(crate) fn assemble_columnar_container(
-    original_len: usize,
-    chunks: &[(u32, u32, Vec<u8>)],
+    original_len:  usize,
+    global_bytes:  Option<&[u8]>,
+    chunks:        &[(u32, u32, Vec<u8>)],
 ) -> Result<Vec<u8>, ScteError> {
-    let section_count = chunks.len() as u16;
-    let multi         = section_count > 1;
+    let chunk_count   = chunks.len() as u16;
+    let has_global    = global_bytes.is_some();
+    let multi         = chunk_count > 1;
+    // Total sections = optional GlobalCols + chunk sections.
+    let section_count = chunk_count + if has_global { 1 } else { 0 };
 
-    // Each section entry is 24 bytes fixed + optional 8-byte meta (multi-chunk).
-    let meta_per_entry: usize = if multi { 8 } else { 0 };
-    let entry_size    = SECTION_ENTRY_FIXED_SIZE + meta_per_entry;
-    let section_tbl   = entry_size * section_count as usize;
+    // Each section entry is SECTION_ENTRY_FIXED_SIZE bytes + optional 8-byte
+    // meta for multi-chunk COLUMNAR sections.
+    let columnar_meta:  usize = if multi { 8 } else { 0 };
+    let global_entry_size    = SECTION_ENTRY_FIXED_SIZE; // GlobalCols has no meta
+    let columnar_entry_size  = SECTION_ENTRY_FIXED_SIZE + columnar_meta;
+    let section_tbl: usize = if has_global { global_entry_size } else { 0 }
+        + columnar_entry_size * chunk_count as usize;
     let header_size   = HEADER_SIZE + section_tbl;
 
-    let total_payload: usize = chunks.iter().map(|(_, _, b)| b.len()).sum();
+    let total_payload: usize = global_bytes.map(|b| b.len()).unwrap_or(0)
+        + chunks.iter().map(|(_, _, b)| b.len()).sum::<usize>();
     let mut result = Vec::with_capacity(header_size + total_payload);
 
     let header = ScteHeader::new(PipelineId::Text, original_len as u64, section_count);
@@ -186,6 +194,15 @@ pub(crate) fn assemble_columnar_container(
 
     // Section entries — compute absolute payload offsets.
     let mut offset: u64 = header_size as u64;
+
+    // GlobalCols section entry (if present).
+    if let Some(gb) = global_bytes {
+        let entry = SectionEntry::new(SectionType::GlobalCols, SectionCodec::None, offset, gb);
+        result.extend_from_slice(&entry.write());
+        offset += gb.len() as u64;
+    }
+
+    // Columnar chunk section entries.
     for (row_start, row_end, bytes) in chunks {
         let mut entry = SectionEntry::new(
             SectionType::Columnar, SectionCodec::None, offset, bytes,
@@ -199,7 +216,11 @@ pub(crate) fn assemble_columnar_container(
         result.extend_from_slice(&entry.write());
         offset += bytes.len() as u64;
     }
-    // Payload data.
+
+    // Payloads.
+    if let Some(gb) = global_bytes {
+        result.extend_from_slice(gb);
+    }
     for (_, _, bytes) in chunks {
         result.extend_from_slice(bytes);
     }

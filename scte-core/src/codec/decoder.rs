@@ -10,6 +10,8 @@ use crate::{
         decode_token_stream_rans,
         tokens_to_json,
         decode_columnar,
+        decode_columnar_with_context,
+        decode_global_cols_section,
     },
     schema::serializer as schema_ser,
     types::{PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
@@ -77,6 +79,8 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
     let mut delta_payload:        &[u8]         = &[];
     // Collect all COLUMNAR sections (sorted by row_start for multi-chunk).
     let mut columnar_chunks: Vec<(u32, &[u8])> = Vec::new();
+    // GlobalCols section payload — shared variant tables for multi-chunk containers.
+    let mut global_cols_payload: Option<&[u8]> = None;
 
     for (idx, section) in sections.iter().enumerate() {
         let start = section.offset as usize;
@@ -92,6 +96,7 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
             SectionType::Tokens    => token_payload        = Some(payload),
             SectionType::TokensRans => tokens_rans_payload = Some(payload),
             SectionType::Delta     => delta_payload        = payload,
+            SectionType::GlobalCols => global_cols_payload = Some(payload),
             SectionType::Columnar => {
                 // row_start is in the first 4 bytes of meta (if present).
                 // For single-chunk files (no meta) we use 0.
@@ -111,8 +116,21 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
         // Sort by row_start to ensure correct order for multi-chunk files.
         columnar_chunks.sort_by_key(|&(r, _)| r);
 
+        // Parse GlobalCols context if present (used for TAG_ENUM_REF chunks).
+        let global_ctx_opt = if let Some(gc_payload) = global_cols_payload {
+            match decode_global_cols_section(gc_payload) {
+                Ok(ctx) => Some(ctx),
+                Err(_)  => None, // tolerate a corrupt global section — fall back to local decode
+            }
+        } else {
+            None
+        };
+
         if columnar_chunks.len() == 1 {
-            return decode_columnar(columnar_chunks[0].1);
+            return decode_columnar_with_context(
+                columnar_chunks[0].1,
+                global_ctx_opt.as_ref(),
+            );
         }
 
         // Multi-chunk: decode each chunk, strip outer `[`/`]`, stitch into one array.
@@ -120,7 +138,7 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
         out.push(b'[');
         let mut first = true;
         for (_, payload) in &columnar_chunks {
-            let decoded = decode_columnar(payload)?;
+            let decoded = decode_columnar_with_context(payload, global_ctx_opt.as_ref())?;
             // Strip the outer `[` and `]` from each chunk's JSON array.
             let inner: &[u8] = if decoded.first() == Some(&b'[')
                 && decoded.last()  == Some(&b']')

@@ -84,6 +84,11 @@ pub enum SectionType {
     Schema,
     /// Columnar encoding — column-major layout for Array<Object> JSON (Phase 2).
     Columnar,
+    /// Global column schema — shared variant tables and FreqTables for all
+    /// subsequent COLUMNAR chunks in a multi-chunk container.  Emitted as the
+    /// first section before the COLUMNAR sections so that per-chunk sections can
+    /// omit redundant variant tables and frequency tables.
+    GlobalCols,
     /// Unrecognised section type — decoder should skip this section.
     Unknown(u8),
 }
@@ -103,6 +108,7 @@ impl SectionType {
             0x08 => Self::Schema,
             0x09 => Self::Columnar,
             0x0A => Self::TokensRans,
+            0x0B => Self::GlobalCols,
             v    => Self::Unknown(v),
         }
     }
@@ -120,6 +126,7 @@ impl SectionType {
             Self::Schema     => 0x08,
             Self::Columnar   => 0x09,
             Self::TokensRans => 0x0A,
+            Self::GlobalCols => 0x0B,
             Self::Unknown(v) => v,
         }
     }

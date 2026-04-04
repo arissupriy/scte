@@ -24,38 +24,38 @@ All figures from `cargo test --release --test benchmark`. `decode(encode(x)) == 
 Dataset                                    Raw         SCTE    enc MB/s   dec MB/s   zstd-3    zstd-19
 ──────────────────────────────────────────────────────────────────────────────────────────────────────
 Real files — nested JSON (row-major text pipeline)
-  users_100.json                         29929B    3070B  10.3%   22.2 MB/s   79.9 MB/s   16.6%   13.2%
-  users_1k.json                         311042B   18074B   5.8%   21.3 MB/s   82.6 MB/s   14.7%    9.4%
-  users_10k.json                       3084967B  164623B   5.3%   17.0 MB/s   75.3 MB/s   14.4%    8.1%
+  users_100.json                         29929B    3070B  10.3%   22.8 MB/s   77.8 MB/s   16.6%   13.2%
+  users_1k.json                         311042B   18074B   5.8%   19.5 MB/s   87.3 MB/s   14.7%    9.4%
+  users_10k.json                       3084967B  164623B   5.3%   16.4 MB/s   75.3 MB/s   14.4%    8.1%
 
 Real files — flat JSON (columnar pipeline)
-  flat_users_1k.json                     54171B    3126B   5.8%   21.1 MB/s  142.5 MB/s   16.7%   12.8%
-  flat_users_10k.json                   551951B   23657B   4.3%   25.1 MB/s  144.8 MB/s   15.9%   10.1%
-  flat_users_100k.json                 5619926B  229811B   4.1%   23.7 MB/s  133.7 MB/s   15.6%    9.8%
+  flat_users_1k.json                     54171B    3126B   5.8%   26.1 MB/s  146.1 MB/s   16.7%   12.8%
+  flat_users_10k.json                   551951B   23657B   4.3%   26.1 MB/s  141.7 MB/s   15.9%   10.1%
+  flat_users_100k.json [GlobalCols]    5619926B  222438B   4.0%   20.4 MB/s  140.4 MB/s   15.6%    9.8%
 
 Entropy ceiling — UUID keys + base64 payloads + random latencies
-  uuid-b64   1000 rows                  109060B   30282B  27.8%   29.3 MB/s  102.8 MB/s   37.9%   36.5%
-  uuid-b64  10000 rows                 1090984B  298988B  27.4%   34.9 MB/s   96.8 MB/s   38.2%   35.9%
+  uuid-b64   1000 rows                  109060B   30282B  27.8%   25.8 MB/s   52.8 MB/s   37.9%   36.5%
+  uuid-b64  10000 rows                 1090984B  298988B  27.4%   37.3 MB/s   97.7 MB/s   38.2%   35.9%
 
 Semi-structured — small-vocab categoricals + random value fields
-  api-semi   1000 rows                  148561B   11983B   8.1%   32.0 MB/s  154.2 MB/s   18.2%   13.4%
-  api-semi   5000 rows                  746507B   55707B   7.5%   30.7 MB/s  156.4 MB/s   18.3%   12.9%
-  api-semi  10000 rows                 1494038B  111353B   7.5%   28.8 MB/s  163.3 MB/s   18.3%   12.7%
+  api-semi   1000 rows                  148561B   11983B   8.1%   35.5 MB/s  165.6 MB/s   18.2%   13.4%
+  api-semi   5000 rows                  746507B   55707B   7.5%   37.4 MB/s  171.6 MB/s   18.3%   12.9%
+  api-semi  10000 rows                 1494038B  111353B   7.5%   32.5 MB/s  161.6 MB/s   18.3%   12.7%
 
 Random flat JSON — no cycling pattern
-  log-json  1000 rows                    99855B    5060B   5.1%   30.4 MB/s  166.2 MB/s   11.4%    7.1%
-  log-json  5000 rows                   503481B   16322B   3.2%   30.3 MB/s  162.7 MB/s   11.3%    6.9%
-  log-json 10000 rows                  1008244B   32639B   3.2%   29.2 MB/s  168.8 MB/s   11.3%    6.8%
+  log-json  1000 rows                    99855B    5060B   5.1%   34.0 MB/s  173.2 MB/s   11.4%    7.1%
+  log-json  5000 rows                   503481B   16322B   3.2%   33.7 MB/s  184.7 MB/s   11.3%    6.9%
+  log-json 10000 rows                  1008244B   32639B   3.2%   32.4 MB/s  184.1 MB/s   11.3%    6.8%
 
 Cycling fields — columnar pipeline, period detector active
-  api-json  1000 rows [periodic]        145641B     862B   0.6%   31.4 MB/s  192.1 MB/s    2.8%    2.2%
-  api-json  5000 rows [periodic]        732641B     862B   0.1%   28.0 MB/s  194.7 MB/s    1.9%    1.5%
-  api-json 10000 rows [periodic]       1466391B    1855B   0.1%   27.5 MB/s  184.7 MB/s    1.7%    1.4%
+  api-json  1000 rows [periodic]        145641B     862B   0.6%   33.0 MB/s  185.1 MB/s    2.8%    2.2%
+  api-json  5000 rows [periodic]        732641B     862B   0.1%   31.8 MB/s  188.1 MB/s    1.9%    1.5%
+  api-json 10000 rows [periodic]       1466391B    1855B   0.1%   29.6 MB/s  183.6 MB/s    1.7%    1.4%
 
 All fields independently random per row
-  api-json  1000 rows [random]          146468B    4491B   3.1%   28.3 MB/s  160.1 MB/s    9.8%    7.3%
-  api-json  5000 rows [random]          737129B   18628B   2.5%   26.9 MB/s  166.0 MB/s    9.6%    7.1%
-  api-json 10000 rows [random]         1475245B   37221B   2.5%   26.8 MB/s  161.2 MB/s    9.6%    7.0%
+  api-json  1000 rows [random]          146468B    4491B   3.1%   33.1 MB/s  189.4 MB/s    9.8%    7.3%
+  api-json  5000 rows [random]          737129B   18628B   2.5%   30.3 MB/s  197.1 MB/s    9.6%    7.1%
+  api-json 10000 rows [random]         1475245B   37221B   2.5%   27.8 MB/s  195.2 MB/s    9.6%    7.0%
 ```
 
 Non-JSON passthrough (byte-exact):
@@ -303,21 +303,22 @@ Prints container metadata: pipeline type, original size, section layout, and per
 ────────────────────────────────────────────────────────────
 ```
 
-**Multi-chunk example** (`flat_users_100k.json` — 100 k rows, split into 13 columnar chunks):
+**Multi-chunk example** (`flat_users_100k.json` — 100 k rows, 1 GlobalCols section + 13 columnar chunks):
 
 ```
 ── SCTE Container ──────────────────────────────────────────
-  file_size      : 229811 bytes
+  file_size      : 222438 bytes
   format version : 0x01
   flags          : 0x00
   pipeline_id    : 0x01  (Text)
   original_size  : 5619926 bytes
-  section_count  : 13
+  section_count  : 14
 ────────────────────────────────────────────────────────────
-  [0]  type=Columnar  codec=None  offset=   440  length=18732  checksum=0x23da6400  ✓
-  [1]  type=Columnar  codec=None  offset= 19172  length=18748  checksum=0xe40d662d  ✓
+  [0]  type=GlobCols  codec=None  offset=     464  length=    636  checksum=0x1121fb95  ✓
+  [1]  type=Columnar  codec=None  offset=    1100  length=  18116  checksum=0x46cd649e  ✓
+  [2]  type=Columnar  codec=None  offset=   19216  length=  18130  checksum=0x52ece6fa  ✓
   ...
-  [12] type=Columnar  codec=None  offset=225221  length= 4590  checksum=0x65c8af53  ✓
+  [13] type=Columnar  codec=None  offset=  218470  length=   3968  checksum=0x178705d0  ✓
 ────────────────────────────────────────────────────────────
 ```
 
@@ -331,7 +332,7 @@ Prints container metadata: pipeline type, original size, section layout, and per
 | `0x08` | `Schema` | Field type schema (enums, timestamps, prefixes) |
 | `0x09` | `Columnar` | Columnar-encoded `Array<Object>` chunk |
 | `0x0A` | `TokensRans` | Multi-stream rANS token payload (Key / Str / misc) |
-| `0x0B` | `Delta` | Integer delta-encoding metadata |
+| `0x0B` | `GlobalCols` | Shared variant tables + FreqTables for multi-chunk containers (≥ 3 chunks) |
 
 ---
 
@@ -353,12 +354,12 @@ Non-JSON files compared byte-exact via SHA-256.
   users_100.json                              29929B →    3070B ( 10.3%)  PASS  (semantic)
   users_1k.json                              311042B →   18074B (  5.8%)  PASS  (semantic)
   users_10k.json                            3084967B →  164623B (  5.3%)  PASS  (semantic)
-  users_100k.json                          30944519B → 1633992B (  5.3%)  PASS  (semantic)
+  users_100k.json                          30944519B → 1626619B (  5.3%)  PASS  (semantic)
 
 === JSON flat — columnar pipeline ===
   flat_users_1k.json                          54171B →    3126B (  5.8%)  PASS  (semantic)
   flat_users_10k.json                        551951B →   23657B (  4.3%)  PASS  (semantic)
-  flat_users_100k.json                      5619926B →  229811B (  4.1%)  PASS  (semantic)  [13 chunks]
+  flat_users_100k.json                      5619926B →  222438B (  4.0%)  PASS  (semantic)  [GlobalCols + 13 chunks]
 
 === Logs — passthrough ===
   HPC_2k.log                                 149178B →  149226B           PASS  (byte-exact, +48 B)
@@ -374,12 +375,12 @@ Non-JSON files compared byte-exact via SHA-256.
   Business-price-indexes-....csv           14297017B → 14297065B          PASS  (byte-exact, +48 B)
   overseas-trade-indexes-....csv           24211830B → 24211878B          PASS  (byte-exact, +48 B)
 
-16 / 16 files PASS
+15 / 15 files PASS
 ```
 
 Key observations:
 - JSON key order is alphabetized on encode; semantic equality is preserved, not byte identity
-- `flat_users_100k.json` exceeds the 8 192-row chunk limit → stored as 13 independent columnar sections
+- `flat_users_100k.json` exceeds the 8 192-row chunk limit → stored as 1 `GlobalCols` section (shared variant tables) + 13 independent `Columnar` sections
 - Non-JSON overhead is always exactly +48 bytes (24-byte container header + 20-byte section entry + 4-byte pad)
 
 ---
