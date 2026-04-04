@@ -18,7 +18,8 @@ pub(crate) use two_pass::encode_json_two_pass_with_tokens;
 pub use canonicalize::canonicalize_json;
 pub use columnar::{ColumnStream, ColumnValue, ColumnarBatch, is_homogeneous_array};
 pub use columnar_pipeline::{detect_homogeneous_array, encode_columnar, decode_columnar};
-pub(crate) use columnar_pipeline::try_encode_columnar_from_tokens;
+pub(crate) use columnar_pipeline::{try_encode_columnar_from_tokens,
+                                    try_encode_columnar_chunks_from_tokens};
 pub use dictionary::{Dictionary, DictEntry, DictEntryKind, EncodedToken, EncodedPayload,
                      encode_with_dict, decode_with_dict};
 pub use entropic::{encode_token_bytes, decode_token_bytes, kind_to_byte, byte_to_kind,

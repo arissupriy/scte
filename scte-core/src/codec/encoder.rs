@@ -5,7 +5,7 @@ use crate::{
     },
     error::ScteError,
     pipelines::text::{encode_json_two_pass_with_tokens, TwoPassOutput,
-                      try_encode_columnar_from_tokens, tokenize_json},
+                      try_encode_columnar_chunks_from_tokens, tokenize_json},
     types::{PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
 };
 
@@ -116,8 +116,10 @@ fn encode_json(input: &[u8]) -> Result<Vec<u8>, ScteError> {
         .map_err(|e| ScteError::EncodeError(format!("tokenize: {e}")))?;
 
     // Try columnar path first (Array<Object> with uniform schema).
-    if let Some(columnar_bytes) = try_encode_columnar_from_tokens(&tokens) {
-        return assemble_columnar_container(input.len(), &columnar_bytes);
+    // Returns one or more chunks; large arrays (≥ COLUMNAR_CHUNK_ROWS) are split
+    // into separate sections for parallel decode and partial access.
+    if let Some(chunks) = try_encode_columnar_chunks_from_tokens(&tokens) {
+        return assemble_columnar_container(input.len(), &chunks);
     }
 
     // Fall back to row-major two-pass pipeline using the pre-parsed tokens.
@@ -127,26 +129,51 @@ fn encode_json(input: &[u8]) -> Result<Vec<u8>, ScteError> {
 
 // ── Columnar path ────────────────────────────────────────────────────────────
 
-/// Assemble a SCTE container for `PipelineId::Text` carrying a single
-/// COLUMNAR section (type 0x09). Replaces the full SCHEMA+DICT+TOKENS+DELTA
-/// layout for Array<Object> JSON inputs.
+/// Assemble a SCTE container for `PipelineId::Text` carrying one or more
+/// COLUMNAR sections (type 0x09).
+///
+/// For single-chunk inputs the layout is identical to the original v1 format
+/// (1 section, no meta bytes).  For multi-chunk inputs each `SectionEntry`
+/// carries an 8-byte meta field `[row_start: u32 LE][row_end: u32 LE]` that
+/// enables parallel decode and partial data access.
 pub(crate) fn assemble_columnar_container(
     original_len: usize,
-    columnar_bytes: &[u8],
+    chunks: &[(u32, u32, Vec<u8>)],
 ) -> Result<Vec<u8>, ScteError> {
-    let section_count: u16 = 1;
-    let section_tbl   = SECTION_ENTRY_FIXED_SIZE * section_count as usize;
+    let section_count = chunks.len() as u16;
+    let multi         = section_count > 1;
+
+    // Each section entry is 24 bytes fixed + optional 8-byte meta (multi-chunk).
+    let meta_per_entry: usize = if multi { 8 } else { 0 };
+    let entry_size    = SECTION_ENTRY_FIXED_SIZE + meta_per_entry;
+    let section_tbl   = entry_size * section_count as usize;
     let header_size   = HEADER_SIZE + section_tbl;
 
-    let col_off: u64 = header_size as u64;
-    let col_sec  = SectionEntry::new(SectionType::Columnar, SectionCodec::None, col_off, columnar_bytes);
-    let header   = ScteHeader::new(PipelineId::Text, original_len as u64, section_count);
+    let total_payload: usize = chunks.iter().map(|(_, _, b)| b.len()).sum();
+    let mut result = Vec::with_capacity(header_size + total_payload);
 
-    let total = header_size + columnar_bytes.len();
-    let mut result = Vec::with_capacity(total);
+    let header = ScteHeader::new(PipelineId::Text, original_len as u64, section_count);
     result.extend_from_slice(&header.write());
-    result.extend_from_slice(&col_sec.write());
-    result.extend_from_slice(columnar_bytes);
+
+    // Section entries — compute absolute payload offsets.
+    let mut offset: u64 = header_size as u64;
+    for (row_start, row_end, bytes) in chunks {
+        let mut entry = SectionEntry::new(
+            SectionType::Columnar, SectionCodec::None, offset, bytes,
+        );
+        if multi {
+            let mut meta = [0u8; 8];
+            meta[0..4].copy_from_slice(&row_start.to_le_bytes());
+            meta[4..8].copy_from_slice(&row_end.to_le_bytes());
+            entry.meta = meta.to_vec();
+        }
+        result.extend_from_slice(&entry.write());
+        offset += bytes.len() as u64;
+    }
+    // Payload data.
+    for (_, _, bytes) in chunks {
+        result.extend_from_slice(bytes);
+    }
     Ok(result)
 }
 

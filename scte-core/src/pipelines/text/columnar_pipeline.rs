@@ -175,6 +175,61 @@ const TAG_UUID: u8 = 0x14;
 /// Wire: TAG_BASE64 + decoded_len varint + decoded_len raw bytes per row.
 const TAG_BASE64: u8 = 0x15;
 
+/// Float column entropy-coded with per-column rANS on delta residuals.
+///
+/// Applied when `row_count ≥ 64` and rANS wire size is strictly smaller than
+/// plain delta-varint encoding (TAG_FLOAT_FIXED).  Decimal precision is still
+/// stored and used during reconstruction.
+///
+/// Wire layout:
+///   TAG_FLOAT_FIXED_RANS  u8
+///   decimals              u8
+///   ft_len                varint
+///   ft_bytes              ft_len bytes  (FreqTable on delta residuals)
+///   orig_delta_len        varint  (delta byte count; needed by rANS decoder)
+///   rans_len              varint
+///   rans_bytes            rans_len bytes
+const TAG_FLOAT_FIXED_RANS: u8 = 0x17;
+
+/// Timestamp column entropy-coded with per-column rANS on epoch delta residuals.
+///
+/// Applied when `row_count ≥ 64` and rANS wire size is strictly smaller than
+/// plain delta-varint encoding (TAG_TIMESTAMP).
+///
+/// Wire layout:
+///   TAG_TIMESTAMP_RANS  u8
+///   ft_len              varint
+///   ft_bytes            ft_len bytes
+///   orig_delta_len      varint
+///   rans_len            varint
+///   rans_bytes          rans_len bytes
+const TAG_TIMESTAMP_RANS: u8 = 0x18;
+
+/// Raw-string column entropy-coded with per-column rANS on the concatenated
+/// UTF-8 byte stream.
+///
+/// Applied when `row_count ≥ 64` and rANS wire size is strictly smaller than
+/// the raw UTF-8 fallback (TAG_RAW_STR).  Helps for columns with non-uniform
+/// character distributions (e.g. email addresses, URL paths, human names).
+///
+/// Wire layout:
+///   TAG_RAW_STR_RANS   u8
+///   lengths_len        varint  (byte count of delta-encoded string lengths)
+///   lengths_bytes      lengths_len bytes
+///   ft_len             varint
+///   ft_bytes           ft_len bytes  (FreqTable on the concatenated bytes)
+///   orig_byte_count    varint  (total bytes in the rANS payload)
+///   rans_len           varint
+///   rans_bytes         rans_len bytes
+const TAG_RAW_STR_RANS: u8 = 0x19;
+
+/// Number of rows per columnar SCTE section when chunking large arrays.
+///
+/// Arrays with more than this many rows are split into multiple SCTE sections.
+/// Each section carries `[row_start: u32 LE][row_end: u32 LE]` in its
+/// `SectionEntry::meta` field, enabling parallel decode and partial access.
+pub(crate) const COLUMNAR_CHUNK_ROWS: usize = 8_192;
+
 const COLUMNAR_VERSION: u8 = 1;
 
 /// Maximum period length to search (caps brute-force O(n·P) scan).
@@ -267,28 +322,61 @@ pub fn encode_columnar(input: &[u8]) -> Result<Vec<u8>, ScteError> {
 /// caller can avoid a second parse for the same input.  Returns `None` if the
 /// token stream does not represent a homogeneous array.
 ///
-/// Used by the single-pass encode path in `encoder.rs`.
+/// For inputs exceeding [`COLUMNAR_CHUNK_ROWS`] rows use
+/// [`try_encode_columnar_chunks_from_tokens`] instead (returns multiple chunks
+/// for multi-section container assembly).
 pub(crate) fn try_encode_columnar_from_tokens(tokens: &[Token]) -> Option<Vec<u8>> {
-    encode_columnar_from_tokens(tokens).ok()
+    let chunks = try_encode_columnar_chunks_from_tokens(tokens)?;
+    if chunks.len() == 1 {
+        Some(chunks.into_iter().next().unwrap().2)
+    } else {
+        // Large arrays chunked — caller should use try_encode_columnar_chunks_from_tokens.
+        // Concatenate for backward-compat single-blob consumers (e.g. tests).
+        Some(chunks.into_iter().flat_map(|(_, _, b)| b).collect())
+    }
+}
+
+/// Encode a pre-tokenized JSON Array\<Object\> as one or more COLUMNAR chunks.
+///
+/// Returns `Some(chunks)` where each chunk is `(row_start, row_end, encoded_bytes)`.
+/// Arrays with ≤ [`COLUMNAR_CHUNK_ROWS`] rows produce a single-element vec.
+/// Larger arrays are split into `⌈row_count / COLUMNAR_CHUNK_ROWS⌉` chunks,
+/// enabling multi-section containers that support parallel decode and partial
+/// data access.
+///
+/// Returns `None` if the input is not a homogeneous `Array<Object>`.
+pub(crate) fn try_encode_columnar_chunks_from_tokens(
+    tokens: &[Token],
+) -> Option<Vec<(u32, u32, Vec<u8>)>> {
+    let extract   = extract_all_columns(tokens)?;
+    let row_count = extract.row_count;
+
+    if row_count <= COLUMNAR_CHUNK_ROWS {
+        let bytes = encode_extract_range(
+            &extract.scalar_cols, &extract.sub_tables, 0, row_count,
+        );
+        return Some(vec![(0u32, row_count as u32, bytes)]);
+    }
+
+    let mut chunks = Vec::new();
+    let mut start  = 0;
+    while start < row_count {
+        let end   = (start + COLUMNAR_CHUNK_ROWS).min(row_count);
+        let bytes = encode_extract_range(
+            &extract.scalar_cols, &extract.sub_tables, start, end,
+        );
+        chunks.push((start as u32, end as u32, bytes));
+        start = end;
+    }
+    Some(chunks)
 }
 
 fn encode_columnar_from_tokens(tokens: &[Token]) -> Result<Vec<u8>, ScteError> {
-    let ExtractResult { row_count, scalar_cols, sub_tables } = extract_all_columns(tokens)
+    let extract = extract_all_columns(tokens)
         .ok_or_else(|| ScteError::EncodeError("not a homogeneous JSON array".into()))?;
-
-    let col_count = scalar_cols.len() + sub_tables.len();
-    let mut out = Vec::new();
-    out.push(COLUMNAR_VERSION);
-    varint::encode_usize(row_count, &mut out);
-    varint::encode_usize(col_count, &mut out);
-
-    for (idx, col) in scalar_cols.iter().enumerate() {
-        encode_one_column(col, idx, &scalar_cols, row_count, &mut out);
-    }
-    for sub in &sub_tables {
-        encode_sub_table(sub, &mut out);
-    }
-    Ok(out)
+    Ok(encode_extract_range(
+        &extract.scalar_cols, &extract.sub_tables, 0, extract.row_count,
+    ))
 }
 
 /// Decode a COLUMNAR section back to the original JSON bytes.
@@ -815,6 +903,20 @@ fn encode_by_type(col: &RawColumn, _row_count: usize, out: &mut Vec<u8>) {
                 out.extend_from_slice(&base_enc);
             } else {
                 let data = encode_delta_ints(&scaled);
+                // Try rANS on the delta bytes — helps for smooth float columns
+                // where deltas cluster around a few values.
+                if values.len() >= 64 {
+                    if let Some((ft_bytes, rans_bytes)) = try_rans_on_bytes(&data) {
+                        out.push(TAG_FLOAT_FIXED_RANS);
+                        out.push(decimals);
+                        varint::encode_usize(ft_bytes.len(), out);
+                        out.extend_from_slice(&ft_bytes);
+                        varint::encode_usize(data.len(), out);
+                        varint::encode_usize(rans_bytes.len(), out);
+                        out.extend_from_slice(&rans_bytes);
+                        return;
+                    }
+                }
                 out.push(TAG_FLOAT_FIXED);
                 out.push(decimals);
                 varint::encode_usize(data.len(), out);
@@ -875,6 +977,19 @@ fn encode_by_type(col: &RawColumn, _row_count: usize, out: &mut Vec<u8>) {
                 out.extend_from_slice(&base_enc);
             } else {
                 let data = encode_delta_ints(&epoch_vals);
+                // Try rANS — timestamp deltas (seconds/ms between events) often
+                // have a skewed distribution that rANS can exploit.
+                if values.len() >= 64 {
+                    if let Some((ft_bytes, rans_bytes)) = try_rans_on_bytes(&data) {
+                        out.push(TAG_TIMESTAMP_RANS);
+                        varint::encode_usize(ft_bytes.len(), out);
+                        out.extend_from_slice(&ft_bytes);
+                        varint::encode_usize(data.len(), out);
+                        varint::encode_usize(rans_bytes.len(), out);
+                        out.extend_from_slice(&rans_bytes);
+                        return;
+                    }
+                }
                 out.push(TAG_TIMESTAMP);
                 varint::encode_usize(data.len(), out);
                 out.extend_from_slice(&data);
@@ -947,7 +1062,24 @@ fn encode_by_type(col: &RawColumn, _row_count: usize, out: &mut Vec<u8>) {
             return;
         }
 
-        // High-cardinality, no strprefix/hexsuffix/UUID/base64 match → raw strings
+        // High-cardinality, no strprefix/hexsuffix/UUID/base64 match → raw strings.
+        // Try rANS on the concatenated byte stream (names, emails, paths, etc.).
+        if strs.len() >= 64 {
+            let all_bytes: Vec<u8> = strs.iter().flat_map(|s| s.bytes()).collect();
+            if let Some((ft_bytes, rans_bytes)) = try_rans_on_bytes(&all_bytes) {
+                let lens: Vec<i64> = strs.iter().map(|s| s.len() as i64).collect();
+                let lens_enc = encode_delta_ints(&lens);
+                out.push(TAG_RAW_STR_RANS);
+                varint::encode_usize(lens_enc.len(), out);
+                out.extend_from_slice(&lens_enc);
+                varint::encode_usize(ft_bytes.len(), out);
+                out.extend_from_slice(&ft_bytes);
+                varint::encode_usize(all_bytes.len(), out);
+                varint::encode_usize(rans_bytes.len(), out);
+                out.extend_from_slice(&rans_bytes);
+                return;
+            }
+        }
         out.push(TAG_RAW_STR);
         for s in &strs {
             varint::encode_usize(s.len(), out);
@@ -1034,6 +1166,51 @@ fn encode_int_column(ints: &[i64], out: &mut Vec<u8>) {
     out.push(TAG_INT);
     varint::encode_usize(deltas.len(), out);
     out.extend_from_slice(&deltas);
+}
+
+// ── rANS helper ───────────────────────────────────────────────────────────────
+
+/// Attempt to entropy-code `data` with rANS.
+///
+/// Returns `Some((ft_bytes, rans_bytes))` when the rANS representation is
+/// **strictly** smaller than the naive `varint(len) + raw_bytes` layout.
+/// Returns `None` immediately for inputs shorter than 32 bytes — overhead
+/// never pays off at that scale.
+fn try_rans_on_bytes(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if data.len() < 32 { return None; }
+
+    let freq     = FreqTable::build(data, 256, 14);
+    let ft_bytes = freq.serialize();
+
+    // Fast entropy estimate — avoids a full rans_encode if it clearly cannot win.
+    let m = freq.m as u64;
+    let est_bits: u64 = freq.norm_freqs.iter().zip(freq.raw_freqs.iter())
+        .filter(|(&nf, &rf)| nf > 0 && rf > 0)
+        .map(|(&nf, &rf)| {
+            let log_m  = m.next_power_of_two().trailing_zeros() as u64;
+            let log_nf = (nf as u64).next_power_of_two().trailing_zeros() as u64;
+            (rf as u64) * (log_m.saturating_sub(log_nf) + 1)
+        })
+        .sum();
+    let est_rans_bytes = (est_bits / 8 + 1) as usize;
+
+    let varint_len = |mut n: usize| -> usize {
+        let mut l = 1usize; while n >= 0x80 { n >>= 7; l += 1; } l
+    };
+    let raw_total  = varint_len(data.len()) + data.len();
+    let rans_est   = varint_len(ft_bytes.len()) + ft_bytes.len()
+        + varint_len(data.len()) + varint_len(est_rans_bytes) + est_rans_bytes;
+    if rans_est >= raw_total { return None; }
+
+    // Estimate says rANS wins — do the actual encode.
+    let rans_bytes = rans_encode(data, &freq).ok()?;
+    let rans_total = varint_len(ft_bytes.len()) + ft_bytes.len()
+        + varint_len(data.len()) + varint_len(rans_bytes.len()) + rans_bytes.len();
+    if rans_total < raw_total {
+        Some((ft_bytes, rans_bytes))
+    } else {
+        None
+    }
 }
 
 /// Encode a string column as an enum (or fall back to RawStr).
@@ -1433,6 +1610,95 @@ fn encode_sub_table(sub: &SubTable, out: &mut Vec<u8>) {
     }
 }
 
+// ── Chunked columnar encoding ─────────────────────────────────────────────────
+
+/// Encode the row-range `[row_start, row_end)` from pre-extracted columns into
+/// a complete COLUMNAR section body (version byte, row_count, col_count, columns).
+///
+/// This is the inner worker for both the single-chunk fast path and the
+/// multi-chunk path in [`try_encode_columnar_chunks_from_tokens`].
+fn encode_extract_range(
+    scalar_cols: &[RawColumn],
+    sub_tables:  &[SubTable],
+    row_start:   usize,
+    row_end:     usize,
+) -> Vec<u8> {
+    let row_count = row_end - row_start;
+    let col_count = scalar_cols.len() + sub_tables.len();
+    let mut out   = Vec::new();
+    out.push(COLUMNAR_VERSION);
+    varint::encode_usize(row_count, &mut out);
+    varint::encode_usize(col_count, &mut out);
+
+    // Slice scalar columns to the requested row range.
+    let sliced: Vec<RawColumn> = scalar_cols.iter().map(|col| RawColumn {
+        key_path: col.key_path.clone(),
+        values:   col.values[row_start..row_end].to_vec(),
+    }).collect();
+    for (idx, col) in sliced.iter().enumerate() {
+        encode_one_column(col, idx, &sliced, row_count, &mut out);
+    }
+    for sub in sub_tables {
+        encode_sub_table_range(sub, row_start, row_end, &mut out);
+    }
+    out
+}
+
+/// Encode the sub-table rows that correspond to parent rows `[row_start, row_end)`.
+///
+/// The element range is derived by summing `sub.counts[..row_start]` and
+/// `sub.counts[..row_end]`, then slicing items accordingly.  Nested sub-tables
+/// are handled recursively using the derived element range as their row range.
+fn encode_sub_table_range(
+    sub:       &SubTable,
+    row_start:  usize,
+    row_end:    usize,
+    out:       &mut Vec<u8>,
+) {
+    // Path + tag
+    varint::encode_usize(sub.path.len(), out);
+    out.extend_from_slice(sub.path.as_bytes());
+    out.push(TAG_SUB_TABLE);
+
+    // Element range for the requested parent-row slice.
+    let elem_start: usize = sub.counts[..row_start].iter().sum();
+    let elem_end:   usize = sub.counts[..row_end].iter().sum();
+    let total_elements    = elem_end - elem_start;
+
+    varint::encode_usize(total_elements, out);
+
+    // Per-chunk row counts, delta-encoded.
+    let chunk_counts: Vec<i64> = sub.counts[row_start..row_end]
+        .iter().map(|&c| c as i64).collect();
+    let count_body = encode_delta_ints(&chunk_counts);
+    varint::encode_usize(count_body.len(), out);
+    out.extend_from_slice(&count_body);
+
+    match &sub.items {
+        SubItems::Scalars(values) => {
+            varint::encode_usize(1, out); // sub_col_count = 1
+            varint::encode_usize(0, out); // empty path
+            let sliced = values[elem_start..elem_end].to_vec();
+            let col = RawColumn { key_path: String::new(), values: sliced };
+            encode_by_type(&col, total_elements, out);
+        }
+        SubItems::Objects { scalar_cols, sub_tables } => {
+            varint::encode_usize(scalar_cols.len() + sub_tables.len(), out);
+            let sliced_scalars: Vec<RawColumn> = scalar_cols.iter().map(|col| RawColumn {
+                key_path: col.key_path.clone(),
+                values:   col.values[elem_start..elem_end].to_vec(),
+            }).collect();
+            for (idx, col) in sliced_scalars.iter().enumerate() {
+                encode_one_column(col, idx, &sliced_scalars, total_elements, out);
+            }
+            // Nested sub-tables: their "rows" are indexed by element position.
+            for nested in sub_tables {
+                encode_sub_table_range(nested, elem_start, elem_end, out);
+            }
+        }
+    }
+}
+
 // ── Bit packing ───────────────────────────────────────────────────────────────
 
 fn pack_bits(bools: &[bool]) -> Vec<u8> {
@@ -1804,6 +2070,82 @@ fn decode_one_column(
                 };
                 result.push(arr);
                 offset += cnt;
+            }
+            result
+        }
+        TAG_FLOAT_FIXED_RANS => {
+            let decimals = *data.get(*pos)
+                .ok_or_else(|| ScteError::DecodeError("columnar: FLOAT_FIXED_RANS missing decimals".into()))?;
+            *pos += 1;
+            let ft_len   = rd_varint!();
+            let ft_bytes = rd_bytes!(ft_len);
+            let (freq, _) = FreqTable::deserialize(ft_bytes, 0)
+                .map_err(|e| ScteError::DecodeError(format!("columnar: FLOAT_FIXED_RANS ft: {e}")))?;
+            let delta_byte_count = rd_varint!();
+            let rans_len   = rd_varint!();
+            let rans_bytes = rd_bytes!(rans_len);
+            let (delta_bytes, _) = rans_decode(rans_bytes, &freq, delta_byte_count, 0)
+                .map_err(|e| ScteError::DecodeError(format!("columnar: FLOAT_FIXED_RANS rans_decode: {e}")))?;
+            let scaled = decode_delta_ints(&delta_bytes)
+                .ok_or_else(|| ScteError::DecodeError("columnar: FLOAT_FIXED_RANS delta fail".into()))?;
+            if scaled.len() != row_count {
+                return Err(ScteError::DecodeError(
+                    format!("columnar: FLOAT_FIXED_RANS got {} values, expected {row_count}", scaled.len()),
+                ));
+            }
+            scaled.into_iter().map(|s| format_float_fixed(s, decimals)).collect()
+        }
+        TAG_TIMESTAMP_RANS => {
+            let ft_len   = rd_varint!();
+            let ft_bytes = rd_bytes!(ft_len);
+            let (freq, _) = FreqTable::deserialize(ft_bytes, 0)
+                .map_err(|e| ScteError::DecodeError(format!("columnar: TIMESTAMP_RANS ft: {e}")))?;
+            let delta_byte_count = rd_varint!();
+            let rans_len   = rd_varint!();
+            let rans_bytes = rd_bytes!(rans_len);
+            let (delta_bytes, _) = rans_decode(rans_bytes, &freq, delta_byte_count, 0)
+                .map_err(|e| ScteError::DecodeError(format!("columnar: TIMESTAMP_RANS rans_decode: {e}")))?;
+            let epochs = decode_delta_ints(&delta_bytes)
+                .ok_or_else(|| ScteError::DecodeError("columnar: TIMESTAMP_RANS delta fail".into()))?;
+            if epochs.len() != row_count {
+                return Err(ScteError::DecodeError(
+                    format!("columnar: TIMESTAMP_RANS got {} values, expected {row_count}", epochs.len()),
+                ));
+            }
+            epochs.into_iter().map(|e| json_quote(&epoch_to_iso8601(e))).collect()
+        }
+        TAG_RAW_STR_RANS => {
+            let lens_len   = rd_varint!();
+            let lens_bytes = rd_bytes!(lens_len);
+            let lens_i64   = decode_delta_ints(lens_bytes)
+                .ok_or_else(|| ScteError::DecodeError("columnar: RAW_STR_RANS bad lengths".into()))?;
+            if lens_i64.len() != row_count {
+                return Err(ScteError::DecodeError(
+                    format!("columnar: RAW_STR_RANS lens {} != row_count {row_count}", lens_i64.len()),
+                ));
+            }
+            let ft_len   = rd_varint!();
+            let ft_bytes = rd_bytes!(ft_len);
+            let (freq, _) = FreqTable::deserialize(ft_bytes, 0)
+                .map_err(|e| ScteError::DecodeError(format!("columnar: RAW_STR_RANS ft: {e}")))?;
+            let orig_byte_count = rd_varint!();
+            let rans_len   = rd_varint!();
+            let rans_bytes = rd_bytes!(rans_len);
+            let (all_bytes, _) = rans_decode(rans_bytes, &freq, orig_byte_count, 0)
+                .map_err(|e| ScteError::DecodeError(format!("columnar: RAW_STR_RANS rans_decode: {e}")))?;
+            let mut result   = Vec::with_capacity(row_count);
+            let mut byte_pos = 0usize;
+            for l in lens_i64 {
+                let len = l as usize;
+                let end = byte_pos + len;
+                if end > all_bytes.len() {
+                    return Err(ScteError::DecodeError("columnar: RAW_STR_RANS byte overrun".into()));
+                }
+                let s = std::str::from_utf8(&all_bytes[byte_pos..end])
+                    .map_err(|_| ScteError::DecodeError("columnar: RAW_STR_RANS bad utf8".into()))?
+                    .to_owned();
+                result.push(json_quote(&s));
+                byte_pos = end;
             }
             result
         }
@@ -2442,6 +2784,102 @@ mod tests {
             let c_out = crate::pipelines::text::canonicalize_json(&decoded).unwrap();
             assert_eq!(c_in, c_out, "two-pass mismatch for {}", std::str::from_utf8(input).unwrap_or("<binary>"));
         }
+    }
+
+    // ── New feature tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn multi_chunk_roundtrip_above_threshold() {
+        // Generate COLUMNAR_CHUNK_ROWS+50 rows to force multi-chunk encoding.
+        use super::COLUMNAR_CHUNK_ROWS;
+        let n = COLUMNAR_CHUNK_ROWS + 50;
+        let json: Vec<u8> = (0..n)
+            .map(|i| {
+                let s = if i % 3 == 0 { "ok" } else if i % 3 == 1 { "warn" } else { "err" };
+                format!(r#"{{"id":{i},"status":"{s}","score":{:.2}}}"#, (i % 100) as f64 * 0.01)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+            .pipe_wrapped_in_array();
+
+        // Encoding must produce multiple sections.
+        let chunks = try_encode_columnar_chunks_from_tokens(
+            &crate::pipelines::text::tokenizer::tokenize_json(&json).unwrap(),
+        ).expect("chunked encode failed");
+        assert!(chunks.len() >= 2, "expected ≥2 chunks for {} rows, got {}", n, chunks.len());
+
+        // Decode must round-trip correctly.
+        let encoded = crate::codec::encoder::encode(&json).expect("encode failed");
+        let decoded = crate::codec::decoder::decode(&encoded).expect("decode failed");
+        let c_in  = crate::pipelines::text::canonicalize_json(&json).unwrap();
+        let c_out = crate::pipelines::text::canonicalize_json(&decoded).unwrap();
+        assert_eq!(c_in, c_out, "multi-chunk roundtrip mismatch");
+    }
+
+    #[test]
+    fn multi_chunk_row_order_preserved() {
+        // IDs 0..N must round-trip in correct order after multi-chunk decode.
+        // Verified by canonical JSON equality (order must match).
+        use super::COLUMNAR_CHUNK_ROWS;
+        let n = COLUMNAR_CHUNK_ROWS + 100;
+        let json: Vec<u8> = (0..n)
+            .map(|i| format!(r#"{{"id":{i},"val":{}}}"#, i * 2))
+            .collect::<Vec<_>>()
+            .join(",")
+            .pipe_wrapped_in_array();
+
+        let encoded = crate::codec::encoder::encode(&json).expect("encode failed");
+        let decoded = crate::codec::decoder::decode(&encoded).expect("decode failed");
+        let c_in  = crate::pipelines::text::canonicalize_json(&json).unwrap();
+        let c_out = crate::pipelines::text::canonicalize_json(&decoded).unwrap();
+        assert_eq!(c_in, c_out, "multi-chunk row order mismatch");
+
+        // Quick row-count sanity check.
+        let id_fields = c_out.windows(5).filter(|w| *w == b"\"id\":").count();
+        assert_eq!(id_fields, n, "expected {n} id fields, found {id_fields}");
+    }
+
+    #[test]
+    fn float_fixed_rans_roundtrip() {
+        // Enough rows (≥64) with smooth float values to trigger FLOAT_FIXED_RANS.
+        let json: Vec<u8> = (0..200)
+            .map(|i| format!(r#"{{"v":{:.3}}}"#, (i % 10) as f64 * 0.001))
+            .collect::<Vec<_>>()
+            .join(",")
+            .pipe_wrapped_in_array();
+        roundtrip(&json);
+    }
+
+    #[test]
+    fn timestamp_rans_roundtrip() {
+        // ISO-8601 timestamps with known period — some variants may use TIMESTAMP_RANS.
+        let base = 1700000000i64; // arbitrary epoch
+        let json: Vec<u8> = (0..200)
+            .map(|i| {
+                let ts = base + (i as i64 * 60); // 1-minute intervals
+                let dt = crate::pipelines::text::delta::timestamp::epoch_to_iso8601(ts);
+                format!(r#"{{"ts":"{dt}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+            .pipe_wrapped_in_array();
+        roundtrip(&json);
+    }
+
+    #[test]
+    fn raw_str_rans_roundtrip() {
+        // High-cardinality strings with a skewed character distribution
+        // (all lowercase letters + digits) to exercise TAG_RAW_STR_RANS.
+        let json: Vec<u8> = (0..200)
+            .map(|i| {
+                // Names drawn from a small alphabet — rANS should compress well.
+                let name = format!("user_{:08}", i % 50);
+                format!(r#"{{"name":"{name}","n":{i}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+            .pipe_wrapped_in_array();
+        roundtrip(&json);
     }
 
     // Helper: wrap a comma-joined string in [ ... ]

@@ -73,7 +73,8 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
     let mut dict_payload:   Option<&[u8]> = None;
     let mut token_payload:  Option<&[u8]> = None;
     let mut delta_payload:  &[u8]         = &[];
-    let mut columnar_payload: Option<&[u8]> = None;
+    // Collect all COLUMNAR sections (sorted by row_start for multi-chunk).
+    let mut columnar_chunks: Vec<(u32, &[u8])> = Vec::new();
 
     for (idx, section) in sections.iter().enumerate() {
         let start = section.offset as usize;
@@ -84,18 +85,54 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
         section.verify_payload(payload, idx)?;
 
         match section.section_type {
-            SectionType::Schema   => schema_payload   = Some(payload),
-            SectionType::Dict     => dict_payload     = Some(payload),
-            SectionType::Tokens   => token_payload    = Some(payload),
-            SectionType::Delta    => delta_payload    = payload,
-            SectionType::Columnar => columnar_payload = Some(payload),
+            SectionType::Schema   => schema_payload = Some(payload),
+            SectionType::Dict     => dict_payload   = Some(payload),
+            SectionType::Tokens   => token_payload  = Some(payload),
+            SectionType::Delta    => delta_payload  = payload,
+            SectionType::Columnar => {
+                // row_start is in the first 4 bytes of meta (if present).
+                // For single-chunk files (no meta) we use 0.
+                let row_start = if section.meta.len() >= 4 {
+                    u32::from_le_bytes(section.meta[0..4].try_into().unwrap())
+                } else {
+                    0u32
+                };
+                columnar_chunks.push((row_start, payload));
+            }
             _ => {}
         }
     }
 
-    // Fast path: columnar-encoded Array<Object>
-    if let Some(col_data) = columnar_payload {
-        return decode_columnar(col_data);
+    // Fast path: columnar-encoded Array<Object> (single or multi-chunk).
+    if !columnar_chunks.is_empty() {
+        // Sort by row_start to ensure correct order for multi-chunk files.
+        columnar_chunks.sort_by_key(|&(r, _)| r);
+
+        if columnar_chunks.len() == 1 {
+            return decode_columnar(columnar_chunks[0].1);
+        }
+
+        // Multi-chunk: decode each chunk, strip outer `[`/`]`, stitch into one array.
+        let mut out: Vec<u8> = Vec::new();
+        out.push(b'[');
+        let mut first = true;
+        for (_, payload) in &columnar_chunks {
+            let decoded = decode_columnar(payload)?;
+            // Strip the outer `[` and `]` from each chunk's JSON array.
+            let inner: &[u8] = if decoded.first() == Some(&b'[')
+                && decoded.last()  == Some(&b']')
+            {
+                &decoded[1..decoded.len() - 1]
+            } else {
+                &decoded
+            };
+            if inner.is_empty() { continue; }
+            if !first { out.push(b','); }
+            out.extend_from_slice(inner);
+            first = false;
+        }
+        out.push(b']');
+        return Ok(out);
     }
 
     let schema_bytes = schema_payload
