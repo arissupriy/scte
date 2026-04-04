@@ -232,7 +232,7 @@ scte/
 ## Building
 
 ```bash
-# Build
+# Build everything
 cargo build --release
 
 # Run unit tests (351 tests)
@@ -243,14 +243,95 @@ cargo test --release --test benchmark -- --nocapture
 
 # Run only correctness tests
 cargo test --release --test benchmark verify
-
-# CLI
-./target/release/scte-cli encode input.json output.scte
-./target/release/scte-cli decode output.scte restored.json
-./target/release/scte-cli inspect output.scte
 ```
 
 Requires: **Rust 1.70+** (stable)
+
+---
+
+## CLI Reference
+
+Build the CLI binary:
+
+```bash
+cargo build --release -p scte-cli
+# binary: target/release/scte-cli
+```
+
+### `encode <input> <output.scte>`
+
+Wraps any file in a SCTE container. Pipeline is selected automatically:
+
+- JSON `Array<Object>` with uniform keys → columnar pipeline
+- Any other JSON → two-pass text pipeline
+- Non-JSON (CSV, XML, logs, binary, …) → verbatim passthrough, byte-exact
+
+```bash
+scte-cli encode data/users.json  data/users.scte
+# encode: 311042 bytes → 18074 bytes  (ratio 0.058)
+```
+
+### `decode <input.scte> <output>`
+
+Restores the original file from a SCTE container.
+
+```bash
+scte-cli decode data/users.scte  data/users_restored.json
+# decode: 18074 bytes → 311042 bytes  ✓ checksum ok
+```
+
+> **Note on JSON:** SCTE canonicalizes JSON on decode — object keys are sorted alphabetically and
+> whitespace is normalized. All field values are preserved exactly; numeric precision and array
+> order are unchanged.  For non-JSON files, decoding is byte-for-byte identical to the original.
+
+### `inspect <input.scte>`
+
+Prints container metadata: pipeline type, original size, section layout, and per-section checksums.
+
+**Single-section example** (`users_1k.json` — 1 k rows, 1 columnar section):
+
+```
+── SCTE Container ──────────────────────────────────────────
+  file_size      : 18074 bytes
+  format version : 0x01
+  flags          : 0x00
+  pipeline_id    : 0x01  (Text)
+  original_size  : 311042 bytes
+  section_count  : 1
+────────────────────────────────────────────────────────────
+  [0]  type=Columnar  codec=None  offset=48  length=18026  checksum=0xf8a294ed  ✓
+────────────────────────────────────────────────────────────
+```
+
+**Multi-chunk example** (`flat_users_100k.json` — 100 k rows, split into 13 columnar chunks):
+
+```
+── SCTE Container ──────────────────────────────────────────
+  file_size      : 229811 bytes
+  format version : 0x01
+  flags          : 0x00
+  pipeline_id    : 0x01  (Text)
+  original_size  : 5619926 bytes
+  section_count  : 13
+────────────────────────────────────────────────────────────
+  [0]  type=Columnar  codec=None  offset=   440  length=18732  checksum=0x23da6400  ✓
+  [1]  type=Columnar  codec=None  offset= 19172  length=18748  checksum=0xe40d662d  ✓
+  ...
+  [12] type=Columnar  codec=None  offset=225221  length= 4590  checksum=0x65c8af53  ✓
+────────────────────────────────────────────────────────────
+```
+
+### Section type codes
+
+| Code | Name | Contents |
+|------|------|----------|
+| `0x01` | `Dict` | Token frequency dictionary |
+| `0x02` | `Tokens` | Legacy rANS/CTW token stream |
+| `0x07` | `Payload` | Verbatim passthrough bytes |
+| `0x08` | `Schema` | Field type schema (enums, timestamps, prefixes) |
+| `0x09` | `Columnar` | Columnar-encoded `Array<Object>` chunk |
+| `0x0A` | `TokensRans` | Multi-stream rANS token payload (Key / Str / misc) |
+| `0x0B` | `Delta` | Integer delta-encoding metadata |
 
 ---
 
@@ -260,6 +341,46 @@ Requires: **Rust 1.70+** (stable)
 - JSON inputs: canonical comparison (all values identical; whitespace and key order normalized)
 - Non-JSON inputs: byte-exact (`decode(encode(x)) == x`)
 - 351 unit tests, 12 integration tests
+
+### CLI Roundtrip Test Results
+
+Verified with `scte-cli encode → scte-cli decode` on all real-world assets.
+JSON files compared semantically (field values identical; key order and whitespace normalized).
+Non-JSON files compared byte-exact via SHA-256.
+
+```
+=== JSON nested — text pipeline ===
+  users_100.json                              29929B →    3070B ( 10.3%)  PASS  (semantic)
+  users_1k.json                              311042B →   18074B (  5.8%)  PASS  (semantic)
+  users_10k.json                            3084967B →  164623B (  5.3%)  PASS  (semantic)
+  users_100k.json                          30944519B → 1633992B (  5.3%)  PASS  (semantic)
+
+=== JSON flat — columnar pipeline ===
+  flat_users_1k.json                          54171B →    3126B (  5.8%)  PASS  (semantic)
+  flat_users_10k.json                        551951B →   23657B (  4.3%)  PASS  (semantic)
+  flat_users_100k.json                      5619926B →  229811B (  4.1%)  PASS  (semantic)  [13 chunks]
+
+=== Logs — passthrough ===
+  HPC_2k.log                                 149178B →  149226B           PASS  (byte-exact, +48 B)
+  OpenStack_2k.log                           593120B →  593168B           PASS  (byte-exact, +48 B)
+  Proxifier_2k.log                           236962B →  237010B           PASS  (byte-exact, +48 B)
+
+=== XML — passthrough ===
+  book5.3.0.xml                                7734B →    7782B           PASS  (byte-exact, +48 B)
+  rows.xml                                222469817B → 222469865B         PASS  (byte-exact, +48 B)
+
+=== CSV — passthrough ===
+  business-operations-survey-2022-....csv   2272701B →  2272749B          PASS  (byte-exact, +48 B)
+  Business-price-indexes-....csv           14297017B → 14297065B          PASS  (byte-exact, +48 B)
+  overseas-trade-indexes-....csv           24211830B → 24211878B          PASS  (byte-exact, +48 B)
+
+16 / 16 files PASS
+```
+
+Key observations:
+- JSON key order is alphabetized on encode; semantic equality is preserved, not byte identity
+- `flat_users_100k.json` exceeds the 8 192-row chunk limit → stored as 13 independent columnar sections
+- Non-JSON overhead is always exactly +48 bytes (24-byte container header + 20-byte section entry + 4-byte pad)
 
 ---
 
