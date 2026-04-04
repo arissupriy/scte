@@ -67,7 +67,7 @@ impl SectionEntry {
     pub fn write(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.serialized_size());
 
-        buf.push(self.section_type as u8);
+        buf.push(self.section_type.as_u8());
         buf.push(self.codec as u8);
         buf.extend_from_slice(&self.offset.to_le_bytes());
         buf.extend_from_slice(&self.length.to_le_bytes());
@@ -93,9 +93,9 @@ impl SectionEntry {
             return Err(ScteError::UnexpectedEof);
         }
 
-        let section_type = SectionType::from_u8(buf[0]).ok_or_else(|| {
-            ScteError::DecodeError(format!("unknown section type: 0x{:02x}", buf[0]))
-        })?;
+        // Unknown section types become SectionType::Unknown(v) — the decoder
+        // skips them gracefully.
+        let section_type = SectionType::from_u8(buf[0]);
 
         let codec = SectionCodec::from_u8(buf[1]).ok_or_else(|| {
             ScteError::DecodeError(format!("unknown section codec: 0x{:02x}", buf[1]))

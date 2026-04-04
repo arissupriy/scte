@@ -79,8 +79,17 @@ pub use codec::encoder::encode;
 /// - `EncodingMode::Raw`        — passthrough, always byte-exact
 pub use codec::encoder::encode_with;
 
+/// Encode with full control: both [`EncodingMode`] and [`EncodingHint`].
+pub use codec::encoder::encode_full;
+
+/// Options bundle (mode + hint) for [`encode_full`].
+pub use codec::encoder::EncodeOptions;
+
 /// Controls whether the encoder transforms JSON or stores bytes verbatim.
 pub use codec::encoder::EncodingMode;
+
+/// Hint to the encoder controlling the speed/ratio trade-off.
+pub use types::EncodingHint;
 
 /// Decode a SCTE container back to original bytes.
 ///

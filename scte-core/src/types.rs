@@ -58,44 +58,96 @@ impl PipelineId {
 // ── Section types ────────────────────────────────────────────────────────────
 
 /// Type of data stored in a section payload.
+///
+/// Unknown section type bytes are represented by `Unknown(u8)` so that decoders
+/// written against older format versions can skip unrecognised sections instead
+/// of hard-erroring on forward-compatible container files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum SectionType {
     /// Global dictionary (token → id mapping).
-    Dict   = 0x01,
+    Dict,
     /// Token stream output of the text pipeline.
-    Tokens = 0x02,
+    Tokens,
+    /// Multi-stream entropy-coded token payload (3 streams: key / str / misc).
+    TokensRans,
     /// Delta ops — cross-record delta + pattern encoding (Phase 6).
-    Delta  = 0x03,
+    Delta,
     /// New chunk payloads (binary pipeline, Phase 3).
-    Chunks = 0x04,
+    Chunks,
     /// Hash → file-offset index.
-    Index  = 0x05,
+    Index,
     /// Raw or secondary-encoded data.  ← Phase 1 uses only this.
-    Data   = 0x06,
+    Data,
     /// File-level metadata (original name, mtime, etc.).
-    Meta   = 0x07,
+    Meta,
     /// Inferred field schema — field types, enum mappings, encoding hints (Phase 5).
-    Schema = 0x08,
+    Schema,
     /// Columnar encoding — column-major layout for Array<Object> JSON (Phase 2).
-    Columnar = 0x09,
+    Columnar,
+    /// Unrecognised section type — decoder should skip this section.
+    Unknown(u8),
 }
 
 impl SectionType {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    /// Decode a section-type byte.  Never fails — unknown bytes become
+    /// `SectionType::Unknown(v)` so decoders can gracefully skip them.
+    pub fn from_u8(v: u8) -> Self {
         match v {
-            0x01 => Some(Self::Dict),
-            0x02 => Some(Self::Tokens),
-            0x03 => Some(Self::Delta),
-            0x04 => Some(Self::Chunks),
-            0x05 => Some(Self::Index),
-            0x06 => Some(Self::Data),
-            0x07 => Some(Self::Meta),
-            0x08 => Some(Self::Schema),
-            0x09 => Some(Self::Columnar),
-            _    => None,
+            0x01 => Self::Dict,
+            0x02 => Self::Tokens,
+            0x03 => Self::Delta,
+            0x04 => Self::Chunks,
+            0x05 => Self::Index,
+            0x06 => Self::Data,
+            0x07 => Self::Meta,
+            0x08 => Self::Schema,
+            0x09 => Self::Columnar,
+            0x0A => Self::TokensRans,
+            v    => Self::Unknown(v),
         }
     }
+
+    /// Return the canonical wire byte for this section type.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Dict       => 0x01,
+            Self::Tokens     => 0x02,
+            Self::Delta      => 0x03,
+            Self::Chunks     => 0x04,
+            Self::Index      => 0x05,
+            Self::Data       => 0x06,
+            Self::Meta       => 0x07,
+            Self::Schema     => 0x08,
+            Self::Columnar   => 0x09,
+            Self::TokensRans => 0x0A,
+            Self::Unknown(v) => v,
+        }
+    }
+}
+
+// ── Encoding hint ────────────────────────────────────────────────────────────
+
+/// Hint to the encoder controlling the speed/ratio trade-off.
+///
+/// The hint does **not** affect decode (both modes produce the same wire format).
+/// It also does **not** affect correctness: `decode(encode_full(x, opts)) == x`
+/// holds for any combination of [`EncodingMode`] and `EncodingHint`.
+///
+/// # Variants
+/// * `Default` — full pipeline; optimises for the smallest output.
+/// * `Fast`    — skip the most expensive transforms (period detection, heavy
+///   schema inference, rANS). Faster encode; slightly larger output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingHint {
+    /// Full pipeline — best compression ratio.  This is the default.
+    Default,
+    /// Speed-first: disable expensive analysis passes.  Use when encode
+    /// latency matters more than ratio (e.g. hot-path API responses).
+    Fast,
+}
+
+impl Default for EncodingHint {
+    fn default() -> Self { Self::Default }
 }
 
 // ── Section codecs ───────────────────────────────────────────────────────────

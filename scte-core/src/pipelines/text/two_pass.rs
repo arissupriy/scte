@@ -32,8 +32,7 @@ use crate::schema::{FieldType, IntHint};
 use std::collections::HashMap;
 use crate::pipelines::text::{
     dictionary::Dictionary,
-    encode_token_bytes, decode_token_bytes,
-    encode_with_dict, decode_with_dict,
+    encode_token_bytes, decode_token_bytes,    encode_token_bytes_multistream,    encode_with_dict, decode_with_dict,
     tokenize_json,
 };
 use crate::pipelines::text::tokenizer::{Token, TokenKind, TokenPayload};
@@ -48,8 +47,11 @@ use crate::schema::serializer;
 pub struct TwoPassOutput {
     /// Serialized `FileSchema` — write to SCHEMA section (0x08).
     pub schema_bytes: Vec<u8>,
-    /// rANS/CTW-compressed token stream — write to TOKENS section.
+    /// rANS/CTW-compressed token stream — write to TOKENS section (legacy).
     pub token_bytes: Vec<u8>,
+    /// Multi-stream entropy-encoded token stream — write to TOKENS_RANS section (0x0A).
+    /// Falls back to `token_bytes` on encode failure.
+    pub tokens_rans_bytes: Vec<u8>,
     /// Dictionary used — needed for decoding (caller stores in DICT section).
     pub dict: Dictionary,
     /// Schema used — kept for roundtrip testing / decode.
@@ -96,9 +98,11 @@ pub(crate) fn encode_json_two_pass_with_tokens(
     let encoded                      = encode_with_dict(&delta_encoded, &dict);
     let token_bytes                  = encode_token_bytes(&encoded)
         .map_err(|e| ScteError::EncodeError(format!("token_bytes: {e}")))?;
+    let tokens_rans_bytes            = encode_token_bytes_multistream(&encoded)
+        .unwrap_or_else(|_| token_bytes.clone()); // fall back to legacy on error
     let schema_bytes                 = serializer::serialize(&schema);
 
-    Ok(TwoPassOutput { schema_bytes, token_bytes, dict, schema, delta_bytes })
+    Ok(TwoPassOutput { schema_bytes, token_bytes, tokens_rans_bytes, dict, schema, delta_bytes })
 }
 
 /// Decode a two-pass compressed token stream back to a `Token` vec,
@@ -122,6 +126,21 @@ pub fn decode_token_stream(
     let tokens         = decode_with_dict(&encoded, dict)?;
     // Delta must be un-done BEFORE schema decode, because schema_decode converts
     // NumInt(delta) → Str for StrPrefix/FloatFixed/Timestamp fields.
+    let delta_decoded  = delta_decode_tokens(&tokens, schema, delta_bytes);
+    let schema_decoded = schema_decode_tokens(&delta_decoded, schema);
+    Ok(schema_decoded)
+}
+
+/// Identical to [`decode_token_stream`] but reads a `TOKENS_RANS` (0x0A)
+/// section payload that was produced by `encode_token_bytes_multistream`.
+pub fn decode_token_stream_rans(
+    token_bytes: &[u8],
+    dict: &Dictionary,
+    schema: &FileSchema,
+    delta_bytes: &[u8],
+) -> Result<Vec<Token>, ScteError> {
+    let encoded        = crate::pipelines::text::decode_token_bytes_multistream(token_bytes)?;
+    let tokens         = decode_with_dict(&encoded, dict)?;
     let delta_decoded  = delta_decode_tokens(&tokens, schema, delta_bytes);
     let schema_decoded = schema_decode_tokens(&delta_decoded, schema);
     Ok(schema_decoded)

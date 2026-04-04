@@ -6,7 +6,7 @@ use crate::{
     error::ScteError,
     pipelines::text::{encode_json_two_pass_with_tokens, TwoPassOutput,
                       try_encode_columnar_chunks_from_tokens, tokenize_json},
-    types::{PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
+    types::{EncodingHint, PipelineId, SectionCodec, SectionType, MAX_DECOMPRESSED_SIZE},
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -54,14 +54,41 @@ pub enum EncodingMode {
 /// let decoded = scte_core::decode(&raw).unwrap();
 /// assert_eq!(decoded, json);
 /// ```
-pub fn encode_with(input: &[u8], mode: EncodingMode) -> Result<Vec<u8>, ScteError> {
+
+/// Options bundle for [`encode_full`].
+///
+/// Combines an [`EncodingMode`] (what to encode) with an [`EncodingHint`]
+/// (how aggressively to encode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeOptions {
+    /// Controls whether JSON is transformed or stored verbatim.
+    pub mode: EncodingMode,
+    /// Controls the encode speed/ratio trade-off.
+    pub hint: EncodingHint,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self { mode: EncodingMode::Structured, hint: EncodingHint::Default }
+    }
+}
+
+/// Encode `input` bytes with full control over mode and hint.
+///
+/// This is the primary low-level entry point.  [`encode`] and [`encode_with`]
+/// delegate here with `hint = EncodingHint::Default`.
+pub fn encode_full(input: &[u8], options: EncodeOptions) -> Result<Vec<u8>, ScteError> {
     if input.len() > MAX_DECOMPRESSED_SIZE {
         return Err(ScteError::InputTooLarge(input.len()));
     }
-    match mode {
-        EncodingMode::Raw => encode_passthrough(input),
-        EncodingMode::Structured => encode_structured(input),
+    match options.mode {
+        EncodingMode::Raw        => encode_passthrough(input),
+        EncodingMode::Structured => encode_structured_hint(input, options.hint),
     }
+}
+
+pub fn encode_with(input: &[u8], mode: EncodingMode) -> Result<Vec<u8>, ScteError> {
+    encode_full(input, EncodeOptions { mode, hint: EncodingHint::Default })
 }
 
 /// Encode `input` bytes into a SCTE container using [`EncodingMode::Structured`].
@@ -76,9 +103,11 @@ pub fn encode_with(input: &[u8], mode: EncodingMode) -> Result<Vec<u8>, ScteErro
 /// # Errors
 /// - `InputTooLarge` — input exceeds `MAX_DECOMPRESSED_SIZE` (4 GiB)
 pub fn encode(input: &[u8]) -> Result<Vec<u8>, ScteError> {
-    if input.len() > MAX_DECOMPRESSED_SIZE {
-        return Err(ScteError::InputTooLarge(input.len()));
-    }
+    encode_full(input, EncodeOptions::default())
+}
+
+fn encode_structured_hint(input: &[u8], hint: EncodingHint) -> Result<Vec<u8>, ScteError> {
+    let _ = hint; // Fast-path branching wired in per-feature as they are added.
     encode_structured(input)
 }
 
@@ -196,6 +225,12 @@ pub(crate) fn assemble_text_container(
 ) -> Result<Vec<u8>, ScteError> {
     let dict_bytes    = out.dict.serialize();
     let has_delta     = !out.delta_bytes.is_empty();
+    // Use the multi-stream TOKENS_RANS section when available; it is always
+    // present (encode_json_two_pass_with_tokens falls back to token_bytes on
+    // encode failure, so tokens_rans_bytes is never empty).
+    let token_payload = &out.tokens_rans_bytes;
+    let token_section_type = SectionType::TokensRans;
+
     let section_count: u16 = if has_delta { 4 } else { 3 };
     let section_tbl   = SECTION_ENTRY_FIXED_SIZE * section_count as usize;
     let header_size   = HEADER_SIZE + section_tbl;
@@ -204,17 +239,17 @@ pub(crate) fn assemble_text_container(
     let schema_off: u64 = header_size as u64;
     let dict_off:   u64 = schema_off + out.schema_bytes.len() as u64;
     let tokens_off: u64 = dict_off   + dict_bytes.len() as u64;
-    let delta_off:  u64 = tokens_off + out.token_bytes.len() as u64;
+    let delta_off:  u64 = tokens_off + token_payload.len() as u64;
 
-    let schema_sec = SectionEntry::new(SectionType::Schema, SectionCodec::None, schema_off, &out.schema_bytes);
-    let dict_sec   = SectionEntry::new(SectionType::Dict,   SectionCodec::None, dict_off,   &dict_bytes);
-    let tokens_sec = SectionEntry::new(SectionType::Tokens, SectionCodec::None, tokens_off, &out.token_bytes);
+    let schema_sec = SectionEntry::new(SectionType::Schema,   SectionCodec::None, schema_off, &out.schema_bytes);
+    let dict_sec   = SectionEntry::new(SectionType::Dict,     SectionCodec::None, dict_off,   &dict_bytes);
+    let tokens_sec = SectionEntry::new(token_section_type,    SectionCodec::None, tokens_off, token_payload);
 
     let header = ScteHeader::new(PipelineId::Text, original_len as u64, section_count);
 
     let payload_len = out.schema_bytes.len()
         + dict_bytes.len()
-        + out.token_bytes.len()
+        + token_payload.len()
         + if has_delta { out.delta_bytes.len() } else { 0 };
 
     let mut result = Vec::with_capacity(header_size + payload_len);
@@ -228,7 +263,7 @@ pub(crate) fn assemble_text_container(
     }
     result.extend_from_slice(&out.schema_bytes);
     result.extend_from_slice(&dict_bytes);
-    result.extend_from_slice(&out.token_bytes);
+    result.extend_from_slice(token_payload);
     if has_delta {
         result.extend_from_slice(&out.delta_bytes);
     }

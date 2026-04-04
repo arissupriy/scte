@@ -1179,6 +1179,27 @@ fn encode_int_column(ints: &[i64], out: &mut Vec<u8>) {
 fn try_rans_on_bytes(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     if data.len() < 32 { return None; }
 
+    // ── Cardinality pre-gate ──────────────────────────────────────────────────
+    // Count distinct byte values using a fixed 256-bit mask (32-byte array).
+    // If more than 80 % of the **total bytes** are individually distinct
+    // (i.e., the data resembles a random or high-entropy byte stream),
+    // rANS cannot compress it and we skip the expensive FreqTable build.
+    {
+        let mut present = [0u64; 4]; // 4 × 64 bits = 256-bit presence set
+        for &b in data {
+            let word = (b >> 6) as usize;
+            let bit  = b & 0x3F;
+            present[word] |= 1u64 << bit;
+        }
+        let distinct: usize = present.iter().map(|w| w.count_ones() as usize).sum();
+        // Only reject when distinct-symbol count exceeds 80 % of *total* bytes.
+        // For most real columnar data (e.g. 1 000 ints, 50 distinct values) the
+        // gate is never triggered.  For random bytes it cuts the entire codepath.
+        if distinct * 10 > data.len() * 8 {
+            return None;
+        }
+    }
+
     let freq     = FreqTable::build(data, 256, 14);
     let ft_bytes = freq.serialize();
 

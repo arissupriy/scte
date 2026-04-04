@@ -7,6 +7,7 @@ use crate::{
     pipelines::text::{
         Dictionary,
         decode_token_stream,
+        decode_token_stream_rans,
         tokens_to_json,
         decode_columnar,
     },
@@ -69,10 +70,11 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>, ScteError> {
 // ── Text pipeline ─────────────────────────────────────────────────────────────
 
 fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteError> {
-    let mut schema_payload: Option<&[u8]> = None;
-    let mut dict_payload:   Option<&[u8]> = None;
-    let mut token_payload:  Option<&[u8]> = None;
-    let mut delta_payload:  &[u8]         = &[];
+    let mut schema_payload:      Option<&[u8]> = None;
+    let mut dict_payload:         Option<&[u8]> = None;
+    let mut token_payload:        Option<&[u8]> = None; // legacy TOKENS section
+    let mut tokens_rans_payload:  Option<&[u8]> = None; // TOKENS_RANS section (preferred)
+    let mut delta_payload:        &[u8]         = &[];
     // Collect all COLUMNAR sections (sorted by row_start for multi-chunk).
     let mut columnar_chunks: Vec<(u32, &[u8])> = Vec::new();
 
@@ -85,10 +87,11 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
         section.verify_payload(payload, idx)?;
 
         match section.section_type {
-            SectionType::Schema   => schema_payload = Some(payload),
-            SectionType::Dict     => dict_payload   = Some(payload),
-            SectionType::Tokens   => token_payload  = Some(payload),
-            SectionType::Delta    => delta_payload  = payload,
+            SectionType::Schema    => schema_payload      = Some(payload),
+            SectionType::Dict      => dict_payload         = Some(payload),
+            SectionType::Tokens    => token_payload        = Some(payload),
+            SectionType::TokensRans => tokens_rans_payload = Some(payload),
+            SectionType::Delta     => delta_payload        = payload,
             SectionType::Columnar => {
                 // row_start is in the first 4 bytes of meta (if present).
                 // For single-chunk files (no meta) we use 0.
@@ -139,12 +142,18 @@ fn decode_text(input: &[u8], sections: &[SectionEntry]) -> Result<Vec<u8>, ScteE
         .ok_or_else(|| ScteError::DecodeError("text: missing SCHEMA section".into()))?;
     let dict_bytes   = dict_payload
         .ok_or_else(|| ScteError::DecodeError("text: missing DICT section".into()))?;
-    let token_bytes  = token_payload
-        .ok_or_else(|| ScteError::DecodeError("text: missing TOKENS section".into()))?;
 
     let schema = schema_ser::deserialize(schema_bytes)?;
     let dict   = Dictionary::deserialize(dict_bytes)?;
-    let tokens = decode_token_stream(token_bytes, &dict, &schema, delta_payload)?;
+
+    // Prefer TOKENS_RANS (multi-stream) over legacy TOKENS.
+    let tokens = if let Some(tb) = tokens_rans_payload {
+        decode_token_stream_rans(tb, &dict, &schema, delta_payload)?
+    } else {
+        let tb = token_payload
+            .ok_or_else(|| ScteError::DecodeError("text: missing TOKENS section".into()))?;
+        decode_token_stream(tb, &dict, &schema, delta_payload)?
+    };
     Ok(tokens_to_json(&tokens))
 }
 

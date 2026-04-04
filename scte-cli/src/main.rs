@@ -116,16 +116,22 @@ fn cmd_inspect(args: &[String]) {
 
         match SectionEntry::read(remaining) {
             Ok((entry, consumed)) => {
-                let type_name = match entry.section_type {
-                    SectionType::Dict     => "Dict     ",
-                    SectionType::Tokens   => "Tokens   ",
-                    SectionType::Delta    => "Delta    ",
-                    SectionType::Chunks   => "Chunks   ",
-                    SectionType::Index    => "Index    ",
-                    SectionType::Data     => "Data     ",
-                    SectionType::Meta     => "Meta     ",
-                    SectionType::Schema   => "Schema   ",
-                    SectionType::Columnar => "Columnar ",
+                let type_name_buf;
+                let type_name: &str = match entry.section_type {
+                    SectionType::Dict       => "Dict     ",
+                    SectionType::Tokens     => "Tokens   ",
+                    SectionType::TokensRans => "TokRans  ",
+                    SectionType::Delta      => "Delta    ",
+                    SectionType::Chunks     => "Chunks   ",
+                    SectionType::Index      => "Index    ",
+                    SectionType::Data       => "Data     ",
+                    SectionType::Meta       => "Meta     ",
+                    SectionType::Schema     => "Schema   ",
+                    SectionType::Columnar   => "Columnar ",
+                    SectionType::Unknown(v) => {
+                        type_name_buf = format!("0x{v:02x}    ");
+                        &type_name_buf
+                    }
                 };
                 let codec_name = match entry.codec {
                     SectionCodec::None       => "None      ",

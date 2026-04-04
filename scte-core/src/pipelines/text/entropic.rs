@@ -33,7 +33,7 @@
 /// | Bool              | 1 byte: 0x00 = false, 0x01 = true                   |
 
 use crate::{
-    entropy::{codec as entropy_codec, ctw},
+    entropy::{codec as entropy_codec, ctw, FreqTable, rans_encode, rans_decode},
     error::ScteError,
     pipelines::text::{
         dictionary::{EncodedPayload, EncodedToken},
@@ -307,6 +307,253 @@ fn decode_payload(
                 Ok((EncodedPayload::DictId(id), consumed))
             }
         }
+    }
+}
+
+// ── Multi-stream entropy (TOKENS_RANS section) ───────────────────────────────
+//
+// The payload is split into three independent byte streams by token kind,
+// then each stream is independently compressed with rANS (if profitable) or
+// stored raw.  The kind stream is shared with the existing format.
+//
+// Wire format within the TOKENS_RANS section payload:
+// ```text
+// [kind_blob]                                    ← self-delimiting entropy blob
+// [key_tag u8][key_len varint][key_bytes]        ← Key token payloads
+// [str_tag u8][str_len varint][str_bytes]        ← Str token payloads
+// [misc_tag u8][misc_len varint][misc_bytes]     ← Bool/NumInt/NumFloat payloads
+//
+// stream tags:
+//   0x00 = raw bytes
+//   0x01 = rANS : [ft_len varint][ft_bytes][orig_len varint][rans_len varint][rans_bytes]
+//   0x04 = CTW  : [ctw_len varint][ctw_bytes]  (misc stream only)
+// ```
+
+const STREAM_TAG_RAW:  u8 = 0x00;
+const STREAM_TAG_RANS: u8 = 0x01;
+const STREAM_TAG_CTW:  u8 = 0x04;
+
+/// Encode a token stream using three independent sub-streams for Key, Str, and
+/// other payloads.  Returns a blob suitable for a `TOKENS_RANS` section.
+pub fn encode_token_bytes_multistream(tokens: &[EncodedToken]) -> Result<Vec<u8>, ScteError> {
+    // ── 1. kind stream (unchanged from single-stream encode) ─────────────────
+    let kind_bytes: Vec<u8> = tokens.iter().map(|t| kind_to_byte(t.kind)).collect();
+    let kind_blob = entropy_codec::encode_auto(&kind_bytes, TOKEN_KIND_ALPHABET)?;
+
+    // ── 2. split payloads into three streams ─────────────────────────────────
+    let mut key_buf  = Vec::new();
+    let mut str_buf  = Vec::new();
+    let mut misc_buf = Vec::new();
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::Key  => encode_payload(token, &mut key_buf),
+            TokenKind::Str  => encode_payload(token, &mut str_buf),
+            TokenKind::Bool | TokenKind::NumInt | TokenKind::NumFloat
+                            => encode_payload(token, &mut misc_buf),
+            _ => {} // structural tokens (ObjOpen/Close/ArrOpen/Close/Null) carry no payload
+        }
+    }
+
+    // ── 3. compress each stream independently ────────────────────────────────
+    let key_blob  = compress_sub_stream_rans(&key_buf);
+    let str_blob  = compress_sub_stream_rans(&str_buf);
+    let misc_blob = compress_sub_stream_ctw(&misc_buf);
+
+    // ── 4. assemble ───────────────────────────────────────────────────────────
+    let mut out = Vec::with_capacity(
+        kind_blob.len() + key_blob.len() + str_blob.len() + misc_blob.len() + 12,
+    );
+    out.extend_from_slice(&kind_blob);
+    out.extend_from_slice(&key_blob);
+    out.extend_from_slice(&str_blob);
+    out.extend_from_slice(&misc_blob);
+    Ok(out)
+}
+
+/// Encode a sub-stream with rANS if profitable, otherwise raw.
+/// Emits: `[tag u8][data]`
+///   - raw:  `[0x00][len varint][bytes]`
+///   - rANS: `[0x01][ft_bytes (self-describing)][orig_len varint][rans_len varint][rans_bytes]`
+fn compress_sub_stream_rans(data: &[u8]) -> Vec<u8> {
+    if data.len() >= 32 {
+        let freq = FreqTable::build(data, 256, 14);
+        let ft_bytes = freq.serialize();
+        if let Ok(rans_bytes) = rans_encode(data, &freq) {
+            // Compare: rans total vs raw total
+            let varint_len = |mut n: usize| -> usize { let mut l=1; while n>=0x80{n>>=7;l+=1;} l };
+            let raw_total  = 1 + varint_len(data.len()) + data.len();
+            // rANS: tag(1) + ft(self-desc) + orig_len varint + rans_len varint + rans_bytes
+            let rans_total = 1 + ft_bytes.len()
+                + varint_len(data.len()) + varint_len(rans_bytes.len()) + rans_bytes.len();
+            if rans_total < raw_total {
+                let mut out = Vec::with_capacity(rans_total);
+                out.push(STREAM_TAG_RANS);
+                out.extend_from_slice(&ft_bytes);        // self-describing; no length prefix
+                encode_usize(data.len(), &mut out);      // orig_len
+                encode_usize(rans_bytes.len(), &mut out); // rans_len
+                out.extend_from_slice(&rans_bytes);
+                return out;
+            }
+        }
+    }
+    // Fall back to raw.
+    let mut out = Vec::with_capacity(1 + data.len() + 4);
+    out.push(STREAM_TAG_RAW);
+    encode_usize(data.len(), &mut out);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Encode a sub-stream with CTW (for misc payloads) if profitable, else raw.
+/// Emits: `[tag u8][len varint][data]`
+fn compress_sub_stream_ctw(data: &[u8]) -> Vec<u8> {
+    if data.len() > 16 {
+        let ctw_bytes = ctw::encode(data, 8);
+        if ctw_bytes.len() < data.len().saturating_sub(4) {
+            let mut out = Vec::with_capacity(1 + 4 + ctw_bytes.len());
+            out.push(STREAM_TAG_CTW);
+            encode_usize(ctw_bytes.len(), &mut out);
+            out.extend_from_slice(&ctw_bytes);
+            return out;
+        }
+    }
+    let mut out = Vec::with_capacity(1 + data.len() + 4);
+    out.push(STREAM_TAG_RAW);
+    encode_usize(data.len(), &mut out);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Decode a blob produced by `encode_token_bytes_multistream`.
+pub fn decode_token_bytes_multistream(data: &[u8]) -> Result<Vec<EncodedToken>, ScteError> {
+    let mut pos = 0;
+
+    // ── 1. kind stream ────────────────────────────────────────────────────────
+    let (kind_bytes, consumed) = entropy_codec::decode_auto(data, pos)?;
+    pos += consumed;
+
+    // ── 2. read three sub-streams ─────────────────────────────────────────────
+    let (key_buf,  key_consumed)  = read_sub_stream_rans(data, pos)?;  pos += key_consumed;
+    let (str_buf,  str_consumed)  = read_sub_stream_rans(data, pos)?;  pos += str_consumed;
+    let (misc_buf, _misc_consumed) = read_sub_stream_ctw(data, pos)?;
+
+    // ── 3. reconstruct tokens ─────────────────────────────────────────────────
+    let mut key_pos  = 0usize;
+    let mut str_pos  = 0usize;
+    let mut misc_pos = 0usize;
+    let mut tokens = Vec::with_capacity(kind_bytes.len());
+
+    for (i, &kb) in kind_bytes.iter().enumerate() {
+        let kind = byte_to_kind(kb).ok_or_else(|| ScteError::DecodeError(
+            format!("entropic/ms: unknown kind byte {kb:#04X} at index {i}"),
+        ))?;
+
+        let (payload, n) = match kind {
+            TokenKind::Key => {
+                let r = decode_payload(kind, &key_buf, key_pos)?;
+                key_pos += r.1;
+                r
+            }
+            TokenKind::Str => {
+                let r = decode_payload(kind, &str_buf, str_pos)?;
+                str_pos += r.1;
+                r
+            }
+            TokenKind::Bool | TokenKind::NumInt | TokenKind::NumFloat => {
+                let r = decode_payload(kind, &misc_buf, misc_pos)?;
+                misc_pos += r.1;
+                r
+            }
+            _ => (EncodedPayload::None, 0),
+        };
+        let _ = n;
+        tokens.push(EncodedToken { kind, payload });
+    }
+    Ok(tokens)
+}
+
+fn read_sub_stream_rans(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), ScteError> {
+    if pos >= data.len() {
+        return Err(ScteError::DecodeError("entropic/ms: sub-stream truncated".into()));
+    }
+    let tag = data[pos];
+    let mut consumed = 1usize;
+
+    match tag {
+        STREAM_TAG_RAW => {
+            let (len, h) = decode_usize(data, pos + consumed).ok_or_else(|| {
+                ScteError::DecodeError("entropic/ms: raw stream length truncated".into())
+            })?;
+            consumed += h;
+            if pos + consumed + len > data.len() {
+                return Err(ScteError::DecodeError("entropic/ms: raw stream data truncated".into()));
+            }
+            let buf = data[pos + consumed..pos + consumed + len].to_vec();
+            consumed += len;
+            Ok((buf, consumed))
+        }
+        STREAM_TAG_RANS => {
+            // FreqTable is serialized with a self-reported length; read it.
+            let (freq, ft_consumed) = FreqTable::deserialize(data, pos + consumed)
+                .map_err(|e| ScteError::DecodeError(format!("entropic/ms: FreqTable: {e}")))?;
+            consumed += ft_consumed;
+
+            let (orig_len, h2) = decode_usize(data, pos + consumed).ok_or_else(|| {
+                ScteError::DecodeError("entropic/ms: rANS orig_len truncated".into())
+            })?;
+            consumed += h2;
+            let (rans_len, h3) = decode_usize(data, pos + consumed).ok_or_else(|| {
+                ScteError::DecodeError("entropic/ms: rANS rans_len truncated".into())
+            })?;
+            consumed += h3;
+            if pos + consumed + rans_len > data.len() {
+                return Err(ScteError::DecodeError("entropic/ms: rANS data truncated".into()));
+            }
+            // decode(data, freq, count, pos_within_data)
+            let (buf, _) = rans_decode(data, &freq, orig_len, pos + consumed)
+                .map_err(|e| ScteError::DecodeError(format!("entropic/ms: rans_decode: {e}")))?;
+            consumed += rans_len;
+            Ok((buf, consumed))
+        }
+        t => Err(ScteError::DecodeError(format!("entropic/ms: unknown stream tag {t:#04X}"))),
+    }
+}
+
+fn read_sub_stream_ctw(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), ScteError> {
+    if pos >= data.len() {
+        return Ok((Vec::new(), 0)); // misc stream may be empty
+    }
+    let tag = data[pos];
+    let mut consumed = 1usize;
+
+    match tag {
+        STREAM_TAG_RAW => {
+            let (len, h) = decode_usize(data, pos + consumed).ok_or_else(|| {
+                ScteError::DecodeError("entropic/ms: CTW raw length truncated".into())
+            })?;
+            consumed += h;
+            if pos + consumed + len > data.len() {
+                return Err(ScteError::DecodeError("entropic/ms: CTW raw data truncated".into()));
+            }
+            let buf = data[pos + consumed..pos + consumed + len].to_vec();
+            consumed += len;
+            Ok((buf, consumed))
+        }
+        STREAM_TAG_CTW => {
+            let (ctw_len, h) = decode_usize(data, pos + consumed).ok_or_else(|| {
+                ScteError::DecodeError("entropic/ms: CTW length truncated".into())
+            })?;
+            consumed += h;
+            if pos + consumed + ctw_len > data.len() {
+                return Err(ScteError::DecodeError("entropic/ms: CTW data truncated".into()));
+            }
+            let buf = ctw::decode(&data[pos + consumed..pos + consumed + ctw_len])
+                .ok_or_else(|| ScteError::DecodeError("entropic/ms: CTW decode failed".into()))?;
+            consumed += ctw_len;
+            Ok((buf, consumed))
+        }
+        t => Err(ScteError::DecodeError(format!("entropic/ms: unknown CTW tag {t:#04X}"))),
     }
 }
 
